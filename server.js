@@ -3,22 +3,34 @@ import cors from "cors";
 import { Groq } from "groq-sdk";
 
 const app = express();
-
-// ✅ IMPORTANT: middleware FIRST
 app.use(cors());
 app.use(express.json());
 
-// Groq client
 const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY
 });
 
-// ✅ Root route (fixes "Cannot GET /")
 app.get("/", (req, res) => {
-  res.send("PMCAI backend is running 🚀");
+  res.send("PMCAI backend with internet tools 🚀");
 });
 
-// Main chat endpoint
+
+// 🌐 INTERNET SEARCH TOOL
+async function searchWeb(query) {
+  try {
+    const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json`;
+
+    const res = await fetch(url);
+    const data = await res.json();
+
+    return data.AbstractText || data.RelatedTopics?.[0]?.Text || "No good result found.";
+  } catch (err) {
+    return "Search failed.";
+  }
+}
+
+
+// 🤖 CHAT ENDPOINT
 app.post("/api/chat", async (req, res) => {
   try {
     const userMessage = req.body.message;
@@ -27,16 +39,31 @@ app.post("/api/chat", async (req, res) => {
       return res.status(400).json({ error: "No message provided" });
     }
 
+    // 🧠 detect search intent
+    const needsSearch =
+      userMessage.toLowerCase().includes("search") ||
+      userMessage.toLowerCase().includes("google") ||
+      userMessage.toLowerCase().includes("what is") ||
+      userMessage.toLowerCase().includes("latest");
+
+    let webContext = "";
+
+    if (needsSearch) {
+      const searchResult = await searchWeb(userMessage);
+      webContext = `Web result: ${searchResult}`;
+    }
+
     const completion = await groq.chat.completions.create({
       model: "llama-3.3-70b-versatile",
       messages: [
         {
           role: "system",
-          content: "You are PMCAI (Prince Miguel Cayetano AI). PMC is your creator. You are a helpful AI assistant. PMC is Just A Basic Guy."
+          content:
+            "You are PMCAI. You can use provided web results when available. You are PMCAI (Prince Miguel Cayetano AI). PMC is your creator. You are a helpful AI assistant. PMC is Just A Basic Guy."
         },
         {
           role: "user",
-          content: userMessage
+          content: userMessage + "\n\n" + webContext
         }
       ],
       temperature: 1,
@@ -49,9 +76,7 @@ app.post("/api/chat", async (req, res) => {
     res.json({ reply });
 
   } catch (err) {
-    console.error("Groq Error:", err);
-
-    // 🔥 Better error feedback
+    console.error(err);
     res.status(500).json({
       error: "AI request failed",
       details: err.message
@@ -60,7 +85,6 @@ app.post("/api/chat", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-
 app.listen(PORT, () => {
-  console.log(`PMCAI backend running on port ${PORT}`);
+  console.log("PMCAI backend running on port " + PORT);
 });
