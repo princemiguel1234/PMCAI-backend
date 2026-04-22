@@ -1,12 +1,21 @@
 import express from "express";
+import cors from "cors";
 import { Groq } from "groq-sdk";
 
 const app = express();
+
+// ✅ IMPORTANT: middleware FIRST
+app.use(cors());
 app.use(express.json());
 
-// Groq client (API key comes from Render environment variables)
+// Groq client
 const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY
+});
+
+// ✅ Root route (fixes "Cannot GET /")
+app.get("/", (req, res) => {
+  res.send("PMCAI backend is running 🚀");
 });
 
 // Main chat endpoint
@@ -23,7 +32,7 @@ app.post("/api/chat", async (req, res) => {
       messages: [
         {
           role: "system",
-          content: "You are PMCAI (Prince Miguel Cayetano AI) Dont call Yourself PMC ( Prince Miguel Cayetano ), PMC Is Your Creator , Your a helpful AI assistant."
+          content: "You are PMCAI (Prince Miguel Cayetano AI). PMC is your creator. You are a helpful AI assistant."
         },
         {
           role: "user",
@@ -40,12 +49,16 @@ app.post("/api/chat", async (req, res) => {
     res.json({ reply });
 
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "AI request failed" });
+    console.error("Groq Error:", err);
+
+    // 🔥 Better error feedback
+    res.status(500).json({
+      error: "AI request failed",
+      details: err.message
+    });
   }
 });
 
-// Start server (Render uses PORT automatically)
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
