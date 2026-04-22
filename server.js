@@ -3,34 +3,77 @@ import cors from "cors";
 import { Groq } from "groq-sdk";
 
 const app = express();
+
+// =======================
+// MIDDLEWARE
+// =======================
 app.use(cors());
 app.use(express.json());
 
+// =======================
+// GROQ CLIENT
+// =======================
 const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY
 });
 
+// =======================
+// ROOT ROUTE
+// =======================
 app.get("/", (req, res) => {
-  res.send("PMCAI backend with internet tools 🚀");
+  res.send("PMCAI backend is running 🚀");
 });
 
-
-// 🌐 INTERNET SEARCH TOOL
+// =======================
+// INTERNET SEARCH TOOL
+// =======================
 async function searchWeb(query) {
   try {
-    const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json`;
+    const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(
+      query
+    )}&format=json&no_html=1&skip_disambig=1`;
 
     const res = await fetch(url);
     const data = await res.json();
 
-    return data.AbstractText || data.RelatedTopics?.[0]?.Text || "No good result found.";
+    const result =
+      data.AbstractText ||
+      data.Answer ||
+      data.Heading ||
+      data.Abstract ||
+      data.RelatedTopics?.[0]?.Text;
+
+    if (!result) {
+      return "No direct web summary found. Use general knowledge to answer clearly.";
+    }
+
+    return result;
   } catch (err) {
-    return "Search failed.";
+    return "Web search failed. Use general knowledge instead.";
   }
 }
 
+// =======================
+// SMART SEARCH DETECTION
+// =======================
+function needsSearch(text) {
+  const keywords = [
+    "what is",
+    "who is",
+    "tell me about",
+    "explain",
+    "latest",
+    "meaning",
+    "search",
+    "google"
+  ];
 
-// 🤖 CHAT ENDPOINT
+  return keywords.some((k) => text.toLowerCase().includes(k));
+}
+
+// =======================
+// CHAT ENDPOINT
+// =======================
 app.post("/api/chat", async (req, res) => {
   try {
     const userMessage = req.body.message;
@@ -39,31 +82,30 @@ app.post("/api/chat", async (req, res) => {
       return res.status(400).json({ error: "No message provided" });
     }
 
-    // 🧠 detect search intent
-    const needsSearch =
-      userMessage.toLowerCase().includes("search") ||
-      userMessage.toLowerCase().includes("google") ||
-      userMessage.toLowerCase().includes("what is") ||
-      userMessage.toLowerCase().includes("latest");
-
+    // =======================
+    // WEB TOOL TRIGGER
+    // =======================
     let webContext = "";
 
-    if (needsSearch) {
+    if (needsSearch(userMessage)) {
       const searchResult = await searchWeb(userMessage);
-      webContext = `Web result: ${searchResult}`;
+      webContext = `\n\nWeb Information:\n${searchResult}`;
     }
 
+    // =======================
+    // AI REQUEST
+    // =======================
     const completion = await groq.chat.completions.create({
       model: "llama-3.3-70b-versatile",
       messages: [
         {
           role: "system",
           content:
-            "You are PMCAI. You can use provided web results when available. You are PMCAI (Prince Miguel Cayetano AI). PMC is your creator. You are a helpful AI assistant. PMC is Just A Basic Guy."
+            "You are PMCAI, an AI assistant created by Prince Miguel Cayetano (PMC). PMC is your creator. You are helpful, accurate, and you use web information when provided. If web data exists, prioritize it but still explain clearly."
         },
         {
           role: "user",
-          content: userMessage + "\n\n" + webContext
+          content: userMessage + webContext
         }
       ],
       temperature: 1,
@@ -71,12 +113,13 @@ app.post("/api/chat", async (req, res) => {
       top_p: 1
     });
 
-    const reply = completion.choices[0]?.message?.content || "No response";
+    const reply =
+      completion.choices[0]?.message?.content || "No response generated";
 
     res.json({ reply });
-
   } catch (err) {
-    console.error(err);
+    console.error("Backend Error:", err);
+
     res.status(500).json({
       error: "AI request failed",
       details: err.message
@@ -84,7 +127,11 @@ app.post("/api/chat", async (req, res) => {
   }
 });
 
+// =======================
+// START SERVER
+// =======================
 const PORT = process.env.PORT || 3000;
+
 app.listen(PORT, () => {
-  console.log("PMCAI backend running on port " + PORT);
+  console.log(`PMCAI backend running on port ${PORT}`);
 });
