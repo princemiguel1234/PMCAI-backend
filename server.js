@@ -32,7 +32,7 @@ app.post("/api/chat", async (req, res) => {
       messages: [
         {
           role: "system",
-          content: "You are PMCAI (Prince Miguel Cayetano AI). PMC is your creator. You are a helpful AI assistant."
+          content: "You are PMCAI (Prince Miguel Cayetano AI). PMC is your creator. You are a helpful AI assistant. PMC is Just A Basic Guy."
         },
         {
           role: "user",
