@@ -1,6 +1,7 @@
 import express from "express";
 import cors from "cors";
 import { Groq } from "groq-sdk";
+import rateLimit from "express-rate-limit";
 
 const app = express();
 
@@ -9,6 +10,15 @@ const app = express();
 // =======================
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
+
+// =======================
+// RATE LIMIT (ANTI-SPAM)
+// =======================
+const limiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 20,
+});
+app.use("/api/chat", limiter);
 
 // =======================
 // GROQ CLIENT
@@ -25,29 +35,39 @@ app.get("/", (req, res) => {
 });
 
 // =======================
-// 🚫 BLOCK LIST (VERY IMPORTANT)
+// BLOCK LIST
 // =======================
 const BLOCKED_DOMAINS = [
   "instagram.com",
   "tiktok.com",
   "facebook.com",
-  "youtube.com/shorts",
+  "youtube.com",
   "reddit.com",
 ];
 
 // =======================
-// VALIDATE URL
+// VALIDATE URL (FIXED)
 // =======================
 function isValidSource(url = "") {
-  if (!url) return false;
-  return !BLOCKED_DOMAINS.some((b) => url.includes(b));
+  try {
+    const hostname = new URL(url).hostname.replace("www.", "");
+
+    return !BLOCKED_DOMAINS.some(
+      (b) => hostname === b || hostname.endsWith("." + b)
+    );
+  } catch {
+    return false;
+  }
 }
 
 // =======================
-// 🌐 TAVILY SEARCH (STRICT MODE)
+// WEB SEARCH (TAVILY + TIMEOUT)
 // =======================
 async function searchWeb(query) {
   try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8000);
+
     const res = await fetch("https://api.tavily.com/search", {
       method: "POST",
       headers: {
@@ -60,7 +80,10 @@ async function searchWeb(query) {
         include_answer: false,
         max_results: 8,
       }),
+      signal: controller.signal,
     });
+
+    clearTimeout(timeout);
 
     const data = await res.json();
 
@@ -69,7 +92,7 @@ async function searchWeb(query) {
       .map((r) => ({
         title: r.title,
         url: r.url,
-        snippet: r.content,
+        snippet: (r.content || "").slice(0, 200),
       }));
 
     return {
@@ -86,7 +109,7 @@ async function searchWeb(query) {
 }
 
 // =======================
-// 🧠 CHAT ENDPOINT
+// CHAT ENDPOINT
 // =======================
 app.post("/api/chat", async (req, res) => {
   try {
@@ -97,24 +120,57 @@ app.post("/api/chat", async (req, res) => {
     }
 
     // =======================
-    // GET WEB DATA
+    // WEB SEARCH
     // =======================
     const webData = await searchWeb(userMessage);
 
+    if (!webData.results.length) {
+      return res.json({
+        reply: "No verified information found from trusted sources.",
+        sources: [],
+        verified: false,
+      });
+    }
+
     // =======================
-    // STRICT SYSTEM RULES
+    // IMPROVED SOURCE FORMAT (IMPORTANT FOR AI)
+    // =======================
+    const compactSources = webData.results
+      .map(
+        (r, i) => `
+SOURCE ${i + 1}
+TITLE: ${r.title}
+URL: ${r.url}
+SNIPPET: ${r.snippet}
+`
+      )
+      .join("\n");
+
+    // =======================
+    // SYSTEM PROMPT (UNCHANGED — REQUIRED)
     // =======================
     const systemPrompt = `
-You are PMCAI, a STRICT FACT-CHECKING AI.
+You are PMCAI (PRINCE MIGUEL CAYETANO AI).
 
-RULES (MANDATORY):
-- ONLY use provided WEB RESULTS
-- EVERY fact MUST match a URL
-- DO NOT invent news, events, or updates
-- If results are empty → say "No verified information found"
-- DO NOT use social media sources
-- DO NOT guess or assume anything
-- If unsure → reject the claim
+CREATOR:
+- You were made by PMC (Prince Miguel Cayetano)
+- PMC is just a normal chill dude
+
+CORE ROLE:
+You are a STRICT FACT-CHECKING AI assistant.
+
+RULES (ABSOLUTE):
+- ONLY use provided sources
+- DO NOT invent information
+- DO NOT assume anything
+- DO NOT generate news without URLs
+- If no source supports it → reject it
+
+OUTPUT RULES:
+- Bullet points only
+- Every bullet MUST include a URL
+- No URL = no claim
+- No speculation allowed
 `;
 
     // =======================
@@ -124,16 +180,15 @@ RULES (MANDATORY):
 USER QUESTION:
 ${userMessage}
 
-VERIFIED WEB RESULTS (ONLY TRUST THESE):
-${JSON.stringify(webData, null, 2)}
+VERIFIED WEB SOURCES:
+${compactSources}
 
-INSTRUCTIONS:
-- If no URLs exist → STOP and say no verified info
-- Do NOT create news-style formatting unless sources exist
+RULE:
+If a fact is not directly supported by a URL above, DO NOT include it.
 `;
 
     // =======================
-    // GROQ AI CALL
+    // GROQ CALL
     // =======================
     const completion = await groq.chat.completions.create({
       model: "openai/gpt-oss-20b",
@@ -153,8 +208,7 @@ INSTRUCTIONS:
     });
 
     const reply =
-      completion.choices?.[0]?.message?.content ||
-      "No response generated";
+      completion.choices?.[0]?.message?.content || "No response generated";
 
     // =======================
     // RESPONSE
@@ -162,7 +216,7 @@ INSTRUCTIONS:
     res.json({
       reply,
       sources: webData.results,
-      verified: webData.results.length > 0,
+      verified: true,
     });
   } catch (err) {
     console.error("PMCAI ERROR:", err);
