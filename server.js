@@ -1,6 +1,7 @@
 import express from "express";
 import cors from "cors";
 import { Groq } from "groq-sdk";
+import fetch from "node-fetch";
 
 const app = express();
 
@@ -11,21 +12,21 @@ app.use(cors());
 app.use(express.json());
 
 // =======================
-// GROQ CLIENT
+// GROQ CLIENT (AI MODEL)
 // =======================
 const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY
 });
 
 // =======================
-// ROOT ROUTE
+// ROOT
 // =======================
 app.get("/", (req, res) => {
   res.send("PMCAI backend is running 🚀");
 });
 
 // =======================
-// INTERNET SEARCH TOOL
+// 🌐 DUCKDUCKGO SEARCH (FREE INTERNET)
 // =======================
 async function searchWeb(query) {
   try {
@@ -36,39 +37,39 @@ async function searchWeb(query) {
     const res = await fetch(url);
     const data = await res.json();
 
-    const result =
-      data.AbstractText ||
-      data.Answer ||
-      data.Heading ||
-      data.Abstract ||
-      data.RelatedTopics?.[0]?.Text;
+    let results = [];
 
-    if (!result) {
-      return "No direct web summary found. Use general knowledge to answer clearly.";
+    // Main instant answer
+    if (data.AbstractText) {
+      results.push(`Summary: ${data.AbstractText}`);
     }
 
-    return result;
+    if (data.Answer) {
+      results.push(`Answer: ${data.Answer}`);
+    }
+
+    if (data.Heading) {
+      results.push(`Topic: ${data.Heading}`);
+    }
+
+    // Related topics
+    if (data.RelatedTopics && data.RelatedTopics.length > 0) {
+      data.RelatedTopics.slice(0, 4).forEach((item) => {
+        if (item.Text) {
+          results.push(`Related: ${item.Text}`);
+        }
+      });
+    }
+
+    if (results.length === 0) {
+      return "No direct web data found. Use general knowledge.";
+    }
+
+    return results.join("\n");
   } catch (err) {
-    return "Web search failed. Use general knowledge instead.";
+    console.error("Search error:", err);
+    return "Web search failed. Use general knowledge.";
   }
-}
-
-// =======================
-// SMART SEARCH DETECTION
-// =======================
-function needsSearch(text) {
-  const keywords = [
-    "what is",
-    "who is",
-    "tell me about",
-    "explain",
-    "latest",
-    "meaning",
-    "search",
-    "google"
-  ];
-
-  return keywords.some((k) => text.toLowerCase().includes(k));
 }
 
 // =======================
@@ -83,38 +84,48 @@ app.post("/api/chat", async (req, res) => {
     }
 
     // =======================
-    // WEB TOOL TRIGGER
+    // INTERNET CONTEXT
     // =======================
-    let webContext = "";
+    const webData = await searchWeb(userMessage);
 
-    if (needsSearch(userMessage)) {
-      const searchResult = await searchWeb(userMessage);
-      webContext = `\n\nWeb Information:\n${searchResult}`;
-    }
+    const fullPrompt = `
+USER QUESTION:
+${userMessage}
+
+WEB DATA:
+${webData}
+`;
 
     // =======================
-    // AI REQUEST
+    // AI REQUEST (GPT-OSS 20B)
     // =======================
     const completion = await groq.chat.completions.create({
-      model: "llama-3.3-70b-versatile",
+      model: "openai/gpt-oss-20b",
       messages: [
         {
           role: "system",
-          content:
-            "You are PMCAI, an AI assistant created by Prince Miguel Cayetano (PMC). PMC is your creator. You are helpful, accurate, and you use web information when provided. If web data exists, prioritize it but still explain clearly."
+          content: `
+You are PMCAI, an AI assistant created by Prince Miguel Cayetano.
+
+Rules:
+- Use WEB DATA when provided
+- Summarize it naturally (DO NOT copy raw text)
+- If web data is weak, use your own knowledge
+- Be clear, accurate, and helpful
+`
         },
         {
           role: "user",
-          content: userMessage + webContext
+          content: fullPrompt
         }
       ],
-      temperature: 1,
+      temperature: 0.7,
       max_completion_tokens: 1024,
       top_p: 1
     });
 
     const reply =
-      completion.choices[0]?.message?.content || "No response generated";
+      completion.choices?.[0]?.message?.content || "No response generated";
 
     res.json({ reply });
   } catch (err) {
