@@ -11,64 +11,109 @@ app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
 // =======================
-// GROQ AI CLIENT
+// GROQ CLIENT
 // =======================
 const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY,
 });
 
 // =======================
-// ROOT CHECK
+// ROOT
 // =======================
 app.get("/", (req, res) => {
   res.send("PMCAI backend is running 🚀");
 });
 
 // =======================
-// TIMEOUT HELPER (prevents hanging)
+// TIMEOUT WRAPPER
 // =======================
-function timeout(ms) {
-  return new Promise((_, reject) =>
+const timeout = (ms) =>
+  new Promise((_, reject) =>
     setTimeout(() => reject(new Error("Timeout")), ms)
   );
-}
 
 // =======================
-// 🌐 SIMPLE WEB SEARCH (DuckDuckGo Instant API)
+// 🌐 BETTER WEB ENGINE (DuckDuckGo + Wikipedia fallback)
 // =======================
 async function searchWeb(query) {
   try {
-    const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(
+    // 1. DuckDuckGo Instant API
+    const ddgUrl = `https://api.duckduckgo.com/?q=${encodeURIComponent(
       query
     )}&format=json&no_html=1&skip_disambig=1`;
 
-    const res = await Promise.race([
-      fetch(url),
-      timeout(5000),
-    ]);
+    const ddgRes = await fetch(ddgUrl);
+    const ddg = await ddgRes.json();
 
-    const data = await res.json();
-
-    // STRUCTURED OUTPUT (MUCH BETTER FOR AI)
-    const result = {
-      topic: data.Heading || null,
-      summary: data.AbstractText || null,
-      answer: data.Answer || null,
-      related: [],
+    let results = {
+      query,
+      sources: [],
     };
 
-    if (data.RelatedTopics && Array.isArray(data.RelatedTopics)) {
-      result.related = data.RelatedTopics
-        .filter((t) => t.Text)
-        .slice(0, 5)
-        .map((t) => t.Text);
+    // =======================
+    // DDG DATA
+    // =======================
+    if (ddg.Heading) {
+      results.sources.push({
+        type: "topic",
+        text: ddg.Heading,
+      });
     }
 
-    return result;
+    if (ddg.AbstractText) {
+      results.sources.push({
+        type: "summary",
+        text: ddg.AbstractText,
+      });
+    }
+
+    if (ddg.Answer) {
+      results.sources.push({
+        type: "answer",
+        text: ddg.Answer,
+      });
+    }
+
+    if (ddg.RelatedTopics?.length) {
+      ddg.RelatedTopics.slice(0, 5).forEach((t) => {
+        if (t.Text) {
+          results.sources.push({
+            type: "related",
+            text: t.Text,
+          });
+        }
+      });
+    }
+
+    // =======================
+    // WIKIPEDIA FALLBACK (IMPORTANT IMPROVEMENT)
+    // =======================
+    if (!ddg.AbstractText) {
+      const wikiUrl = `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(
+        query
+      )}`;
+
+      try {
+        const wikiRes = await fetch(wikiUrl);
+        const wiki = await wikiRes.json();
+
+        if (wiki.extract) {
+          results.sources.push({
+            type: "wiki",
+            text: wiki.extract,
+          });
+        }
+      } catch (e) {
+        // ignore wiki failure
+      }
+    }
+
+    return results;
   } catch (err) {
     return {
       error: true,
-      message: "Web search failed or unavailable",
+      message: "Web search failed",
+      sources: [],
     };
   }
 }
@@ -90,20 +135,29 @@ app.post("/api/chat", async (req, res) => {
     const webData = await searchWeb(userMessage);
 
     // =======================
-    // BUILD CLEAN PROMPT
+    // STRICT ANTI-HALLUCINATION RULES
+    // =======================
+    const systemPrompt = `
+You are PMCAI, an AI assistant created by Prince Miguel Cayetano.
+
+CRITICAL RULES:
+- ONLY use WEB SOURCES if they exist
+- DO NOT invent news, dates, events, or products
+- If no real data exists, say "No verified information found"
+- NEVER create fake future events
+- Summarize only real provided data
+- Be concise and accurate
+`;
+
+    // =======================
+    // CLEAN CONTEXT
     // =======================
     const fullPrompt = `
 USER QUESTION:
 ${userMessage}
 
-WEB CONTEXT (structured, may be empty or partial):
+WEB SOURCES (use ONLY this, do not hallucinate):
 ${JSON.stringify(webData, null, 2)}
-
-INSTRUCTIONS:
-- Use web context if useful
-- If web context is weak, rely on reasoning
-- Do NOT copy raw text
-- Keep answer clear, helpful, and natural
 `;
 
     // =======================
@@ -114,22 +168,14 @@ INSTRUCTIONS:
       messages: [
         {
           role: "system",
-          content: `
-You are PMCAI, an AI assistant created by Prince Miguel Cayetano.
-
-Rules:
-- Be accurate and helpful
-- Use web context when available
-- If web data is missing, rely on reasoning
-- Keep responses natural and structured
-`,
+          content: systemPrompt,
         },
         {
           role: "user",
           content: fullPrompt,
         },
       ],
-      temperature: 0.7,
+      temperature: 0.4, // lower = less hallucination
       max_completion_tokens: 1024,
       top_p: 1,
     });
@@ -140,7 +186,8 @@ Rules:
 
     res.json({
       reply,
-      webUsed: !webData.error,
+      hasWeb: !webData.error,
+      sources: webData.sources || [],
     });
   } catch (err) {
     console.error("Backend Error:", err);
