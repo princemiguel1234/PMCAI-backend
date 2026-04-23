@@ -2,6 +2,9 @@ import express from "express";
 import cors from "cors";
 import { Groq } from "groq-sdk";
 import rateLimit from "express-rate-limit";
+import fetch from "node-fetch";
+
+const URL = "https://pmcai-backend.onrender.com";
 
 const app = express();
 
@@ -293,3 +296,12 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`PMCAI VERIFIED NEWS AI RUNNING ON PORT ${PORT}`);
 });
+
+setInterval(async () => {
+  try {
+    await fetch(URL);
+    console.log("Self ping success");
+  } catch (err) {
+    console.log("Self ping failed");
+  }
+}, 60 * 1000); // every 1 min
