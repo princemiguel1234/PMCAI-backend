@@ -4,9 +4,13 @@ import { Groq } from "groq-sdk";
 import rateLimit from "express-rate-limit";
 import fetch from "node-fetch";
 
+const app = express();
 const URL = "https://pmcai-backend.onrender.com/ping";
 
-const app = express();
+// =======================
+// MEMORY STORE (SIMPLE BUT STABLE)
+// =======================
+const memoryStore = new Map();
 
 // =======================
 // MIDDLEWARE
@@ -34,11 +38,11 @@ const groq = new Groq({
 // ROOT
 // =======================
 app.get("/", (req, res) => {
-  res.send("PMCAI VERIFIED NEWS AI RUNNING 🚀");
+  res.send("PMCAI RUNNING 🚀");
 });
 
 // =======================
-// BLOCK LIST
+// BLOCKED DOMAINS
 // =======================
 const BLOCKED_DOMAINS = [
   "instagram.com",
@@ -49,7 +53,7 @@ const BLOCKED_DOMAINS = [
 ];
 
 // =======================
-// VALIDATE URL
+// VALID SOURCE CHECK
 // =======================
 function isValidSource(url = "") {
   try {
@@ -63,12 +67,29 @@ function isValidSource(url = "") {
 }
 
 // =======================
-// INTENT DETECTOR (IMPORTANT FIX)
+// INTENT DETECTION (FIXED)
 // =======================
 function isChatOnlyMessage(msg = "") {
-  return /hello|hi|who are you|what is your name|creator|who made you|how are you/i.test(
-    msg
+  return /^(hello|hi|hey|lol|what is your name|who are you|creator|who made you)$/i.test(
+    msg.trim()
   );
+}
+
+// =======================
+// MEMORY FUNCTIONS
+// =======================
+function getMemory(userId) {
+  return memoryStore.get(userId) || [];
+}
+
+function addMemory(userId, msg) {
+  if (!memoryStore.has(userId)) memoryStore.set(userId, []);
+  memoryStore.get(userId).push(msg);
+
+  // limit memory size (prevents spam RAM leak)
+  if (memoryStore.get(userId).length > 20) {
+    memoryStore.get(userId).shift();
+  }
 }
 
 // =======================
@@ -76,9 +97,6 @@ function isChatOnlyMessage(msg = "") {
 // =======================
 async function searchWeb(query) {
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 8000);
-
     const res = await fetch("https://api.tavily.com/search", {
       method: "POST",
       headers: {
@@ -89,26 +107,23 @@ async function searchWeb(query) {
         query,
         search_depth: "basic",
         include_answer: false,
-        max_results: 8,
+        max_results: 6,
       }),
-      signal: controller.signal,
     });
-
-    clearTimeout(timeout);
 
     const data = await res.json();
 
-    const cleaned = (data.results || [])
+    const results = (data.results || [])
       .filter((r) => r.url && isValidSource(r.url))
       .map((r) => ({
         title: r.title,
         url: r.url,
-        snippet: (r.content || "").slice(0, 200),
+        snippet: (r.content || "").slice(0, 180),
       }));
 
-    return { query, results: cleaned };
-  } catch (err) {
-    return { query, results: [], error: true };
+    return results;
+  } catch {
+    return [];
   }
 }
 
@@ -118,6 +133,7 @@ async function searchWeb(query) {
 app.post("/api/chat", async (req, res) => {
   try {
     const userMessage = req.body.message;
+    const userId = req.ip;
 
     if (!userMessage) {
       return res.status(400).json({ error: "No message provided" });
@@ -126,20 +142,52 @@ app.post("/api/chat", async (req, res) => {
     const chatOnly = isChatOnlyMessage(userMessage);
 
     // =======================
-    // WEB SEARCH (ONLY IF NEEDED)
+    // MEMORY UPDATE
     // =======================
-    let webData;
+    addMemory(userId, `User: ${userMessage}`);
 
-    if (chatOnly) {
-      webData = { query: userMessage, results: [] };
-    } else {
-      webData = await searchWeb(userMessage);
+    const memory = getMemory(userId).join("\n");
+
+    // =======================
+    // WEB ONLY WHEN NEEDED
+    // =======================
+    let webResults = [];
+
+    if (!chatOnly && req.body.useWeb === true) {
+      webResults = await searchWeb(userMessage);
     }
 
     // =======================
-    // BLOCK ONLY REAL SEARCH QUERIES
+    // CHAT MODE FIX (NO GLITCH LOOP)
     // =======================
-    if (!webData.results.length && !chatOnly) {
+    if (chatOnly) {
+      const lower = userMessage.toLowerCase();
+
+      let reply = "Hi! I'm PMCAI.";
+
+      if (lower.includes("creator") || lower.includes("made you")) {
+        reply = "I was created by PMC (Prince Miguel Cayetano).";
+      }
+
+      if (lower === "hello" || lower === "hi") {
+        reply = "Hello!";
+      }
+
+      if (lower === "lol") {
+        reply = "lol";
+      }
+
+      return res.json({
+        reply,
+        sources: [],
+        verified: false,
+      });
+    }
+
+    // =======================
+    // STRICT MODE: NO FAKE DATA
+    // =======================
+    if (!webResults.length && !chatOnly && req.body.useWeb === true) {
       return res.json({
         reply: "No verified information found from trusted sources.",
         sources: [],
@@ -150,7 +198,7 @@ app.post("/api/chat", async (req, res) => {
     // =======================
     // FORMAT SOURCES
     // =======================
-    const compactSources = webData.results
+    const sourcesText = webResults
       .map(
         (r, i) => `
 SOURCE ${i + 1}
@@ -162,81 +210,43 @@ SNIPPET: ${r.snippet}
       .join("\n");
 
     // =======================
-    // SYSTEM PROMPT (UNCHANGED AS REQUESTED)
+    // SYSTEM PROMPT (CLEANED)
     // =======================
     const systemPrompt = `
-PMCAI SYSTEM INSTRUCTION (STRICT MODE)
-IDENTITY
-You are PMCAI (Prince Miguel Cayetano AI)
-Created by: PMC (Prince Miguel Cayetano)
-PMC is a normal, chill individual
-CORE ROLE
-You are a Cloud AI Assistant
-Your priority is accuracy, consistency, and safe responses
-HARD RULES (NON-NEGOTIABLE)
-1. Web / Internet Usage Control
-Do NOT use web searches by default
-Only use internet access if the user explicitly requests real-time or web-based information
-If no verified source is available, use internal knowledge carefully and avoid guessing
-2. Source-Based Answers (STRICT MODE)
+You are PMCAI (Prince Miguel Cayetano AI).
+You are a Cloud AI assistant.
+Your Creator Is PMC (Prince Miguel Cayetano)
+Your Creator Is Just a Chill Dude
 
-When the user requests internet-based or factual sourced information:
+RULES:
+- Be accurate and consistent
+- Do NOT invent facts
+- Use provided sources when available
+- If no source exists, say it cannot be verified
+- Do not repeat identical answers unnecessarily
+- Always stay helpful and direct
 
-ONLY use provided or verified sources
-DO NOT invent, assume, or hallucinate data
-DO NOT generate news, updates, or facts without valid URLs
-If no valid source exists → explicitly state that no verified source is available
-Every supported claim MUST include a URL reference
-Never mix unsourced information with sourced information
-3. Repetition Control
-Do NOT repeat identical answers across responses
-Adapt answers based on the user’s latest question
-Only repeat information if the user requests clarification or expansion
-QUERY HANDLING RULES
-You MUST answer normally without restriction for:
-Identity questions (who you are, creator, etc.)
-Greetings and casual conversation
-Capability explanations
-Simple informational chat
-You MUST switch to STRICT MODE when the user asks:
-News or current events
-Real-world updates
-Prices, live data, or time-sensitive info
-“What happened” or investigative questions
-Any request implying external verification
-INTERNAL OPERATION MODES
+MODES:
+Chat Mode: normal conversation
+Search Mode: only when web data is provided
+Identity Mode: questions about PMCAI or creator
 
-You operate using 3 logical modes:
-
-💬 Chat Mode
-Normal conversation
-No web required
-🔍 Search Mode (STRICT CONTROLLED)
-Only activated when user explicitly requests real-time info
-Must use valid sources only
-🧠 Identity Mode
-Answers about PMCAI, creator, and system behavior
-No web usage allowed
-OUTPUT RULES (STRICT)
-If using sources → every bullet or claim must include a valid URL
-If no sources exist → explicitly say information cannot be verified
-Never fabricate links or citations
-Keep responses consistent, structured, and direct
-FINAL PRINCIPLE
-Prioritize accuracy over creativity
-Prioritize user intent over unnecessary restrictions
-Maintain strict separation between sourced and unsourced information
+PRIORITY:
+Accuracy > Creativity > Guessing
 `;
 
     // =======================
     // USER PROMPT
     // =======================
     const fullPrompt = `
-USER QUESTION:
+USER:
 ${userMessage}
 
-VERIFIED SOURCES:
-${compactSources}
+MEMORY:
+${memory}
+
+SOURCES:
+${sourcesText}
 `;
 
     // =======================
@@ -253,43 +263,22 @@ ${compactSources}
       top_p: 1,
     });
 
-    const raw = completion.choices?.[0]?.message?.content;
-
-    // =======================
-    // CHAT MODE OVERRIDE (FIXED BEHAVIOR)
-    // =======================
-    if (chatOnly) {
-      const lower = userMessage.toLowerCase();
-
-      const directAnswer =
-        lower.includes("creator") || lower.includes("made you")
-          ? "I was created by PMC (Prince Miguel Cayetano)."
-          : raw && raw.trim().length > 0
-          ? raw
-          : "Hi! I'm PMCAI.";
-
-      return res.json({
-        reply: directAnswer,
-        sources: [],
-        verified: false,
-      });
-    }
-
-    // =======================
-    // SAFE FALLBACK
-    // =======================
     const reply =
-      raw && raw.trim().length > 0
-        ? raw
-        : "I couldn’t generate a response for this request.";
+      completion.choices?.[0]?.message?.content ||
+      "I couldn't generate a response.";
+
+    // =======================
+    // SAVE AI MEMORY
+    // =======================
+    addMemory(userId, `PMCAI: ${reply}`);
 
     // =======================
     // RESPONSE
     // =======================
     res.json({
       reply,
-      sources: webData.results,
-      verified: true,
+      sources: webResults,
+      verified: webResults.length > 0,
     });
   } catch (err) {
     console.error("PMCAI ERROR:", err);
@@ -302,19 +291,22 @@ ${compactSources}
 });
 
 // =======================
+// SELF PING
+// =======================
+setInterval(async () => {
+  try {
+    await fetch(URL);
+    console.log("Self ping success");
+  } catch {
+    console.log("Self ping failed");
+  }
+}, 60000);
+
+// =======================
 // START SERVER
 // =======================
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-  console.log(`PMCAI VERIFIED NEWS AI RUNNING ON PORT ${PORT}`);
+  console.log(`PMCAI RUNNING ON PORT ${PORT}`);
 });
-
-setInterval(async () => {
-  try {
-    await fetch(URL, { method: "GET" });
-    console.log("Self ping success");
-  } catch (err) {
-    console.log("Self ping failed");
-  }
-}, 60 * 1000);
