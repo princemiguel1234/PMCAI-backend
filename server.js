@@ -21,26 +21,30 @@ const groq = new Groq({
 // ROOT
 // =======================
 app.get("/", (req, res) => {
-  res.send("PMCAI VERIFIED BACKEND RUNNING 🚀");
+  res.send("PMCAI VERIFIED NEWS AI RUNNING 🚀");
 });
 
 // =======================
-// TRUST FILTER (IMPORTANT)
+// 🚫 BLOCK LIST (VERY IMPORTANT)
 // =======================
-function isTrustedSource(url = "") {
-  const badSources = [
-    "instagram.com",
-    "tiktok.com",
-    "facebook.com",
-    "reddit.com/r/",
-    "youtube.com/shorts",
-  ];
+const BLOCKED_DOMAINS = [
+  "instagram.com",
+  "tiktok.com",
+  "facebook.com",
+  "youtube.com/shorts",
+  "reddit.com",
+];
 
-  return !badSources.some((b) => url.includes(b));
+// =======================
+// VALIDATE URL
+// =======================
+function isValidSource(url = "") {
+  if (!url) return false;
+  return !BLOCKED_DOMAINS.some((b) => url.includes(b));
 }
 
 // =======================
-// 🌐 TAVILY WEB SEARCH (CLEAN + FILTERED)
+// 🌐 TAVILY SEARCH (STRICT MODE)
 // =======================
 async function searchWeb(query) {
   try {
@@ -54,16 +58,14 @@ async function searchWeb(query) {
         query,
         search_depth: "basic",
         include_answer: false,
-        include_raw_content: false,
         max_results: 8,
       }),
     });
 
     const data = await res.json();
 
-    const filtered = (data.results || [])
-      .filter((r) => r.url && isTrustedSource(r.url))
-      .slice(0, 5)
+    const cleaned = (data.results || [])
+      .filter((r) => r.url && isValidSource(r.url))
       .map((r) => ({
         title: r.title,
         url: r.url,
@@ -72,7 +74,7 @@ async function searchWeb(query) {
 
     return {
       query,
-      results: filtered,
+      results: cleaned,
     };
   } catch (err) {
     return {
@@ -84,7 +86,7 @@ async function searchWeb(query) {
 }
 
 // =======================
-// CHAT ENDPOINT
+// 🧠 CHAT ENDPOINT
 // =======================
 app.post("/api/chat", async (req, res) => {
   try {
@@ -95,43 +97,43 @@ app.post("/api/chat", async (req, res) => {
     }
 
     // =======================
-    // GET REAL WEB DATA
+    // GET WEB DATA
     // =======================
     const webData = await searchWeb(userMessage);
 
     // =======================
-    // STRICT SYSTEM RULES (ANTI-HALLUCINATION)
+    // STRICT SYSTEM RULES
     // =======================
     const systemPrompt = `
-You are PMCAI, a verified fact-based AI assistant.
+You are PMCAI, a STRICT FACT-CHECKING AI.
 
-CRITICAL RULES:
+RULES (MANDATORY):
 - ONLY use provided WEB RESULTS
-- EVERY claim must match a URL in results
+- EVERY fact MUST match a URL
 - DO NOT invent news, events, or updates
-- If no valid sources exist → say "No verified information found"
-- IGNORE social media-style content if present
-- Summarize ONLY from trusted sources
-- Be strict, factual, and concise
+- If results are empty → say "No verified information found"
+- DO NOT use social media sources
+- DO NOT guess or assume anything
+- If unsure → reject the claim
 `;
 
     // =======================
-    // GROUNDED PROMPT
+    // USER PROMPT
     // =======================
     const fullPrompt = `
 USER QUESTION:
 ${userMessage}
 
-VERIFIED WEB RESULTS:
+VERIFIED WEB RESULTS (ONLY TRUST THESE):
 ${JSON.stringify(webData, null, 2)}
 
-INSTRUCTION:
-- Only use results with URLs
-- If results are empty, stop and say no verified info
+INSTRUCTIONS:
+- If no URLs exist → STOP and say no verified info
+- Do NOT create news-style formatting unless sources exist
 `;
 
     // =======================
-    // AI REQUEST
+    // GROQ AI CALL
     // =======================
     const completion = await groq.chat.completions.create({
       model: "openai/gpt-oss-20b",
@@ -145,7 +147,7 @@ INSTRUCTION:
           content: fullPrompt,
         },
       ],
-      temperature: 0.2, // 🔥 very strict = less hallucination
+      temperature: 0.2,
       max_completion_tokens: 900,
       top_p: 1,
     });
@@ -166,7 +168,7 @@ INSTRUCTION:
     console.error("PMCAI ERROR:", err);
 
     res.status(500).json({
-      error: "Server failure",
+      error: "Server error",
       details: err.message,
     });
   }
@@ -178,5 +180,5 @@ INSTRUCTION:
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-  console.log(`PMCAI VERIFIED BACKEND RUNNING ON PORT ${PORT}`);
+  console.log(`PMCAI VERIFIED NEWS AI RUNNING ON PORT ${PORT}`);
 });
