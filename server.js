@@ -12,7 +12,7 @@ app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
 // =======================
-// RATE LIMIT (ANTI-SPAM)
+// RATE LIMIT
 // =======================
 const limiter = rateLimit({
   windowMs: 60 * 1000,
@@ -46,12 +46,11 @@ const BLOCKED_DOMAINS = [
 ];
 
 // =======================
-// VALIDATE URL (FIXED)
+// VALIDATE URL
 // =======================
 function isValidSource(url = "") {
   try {
     const hostname = new URL(url).hostname.replace("www.", "");
-
     return !BLOCKED_DOMAINS.some(
       (b) => hostname === b || hostname.endsWith("." + b)
     );
@@ -61,7 +60,16 @@ function isValidSource(url = "") {
 }
 
 // =======================
-// WEB SEARCH (TAVILY + TIMEOUT)
+// INTENT DETECTOR (IMPORTANT FIX)
+// =======================
+function isChatOnlyMessage(msg = "") {
+  return /hello|hi|who are you|what is your name|creator|who made you|how are you/i.test(
+    msg
+  );
+}
+
+// =======================
+// WEB SEARCH
 // =======================
 async function searchWeb(query) {
   try {
@@ -95,16 +103,9 @@ async function searchWeb(query) {
         snippet: (r.content || "").slice(0, 200),
       }));
 
-    return {
-      query,
-      results: cleaned,
-    };
+    return { query, results: cleaned };
   } catch (err) {
-    return {
-      query,
-      results: [],
-      error: true,
-    };
+    return { query, results: [], error: true };
   }
 }
 
@@ -119,12 +120,23 @@ app.post("/api/chat", async (req, res) => {
       return res.status(400).json({ error: "No message provided" });
     }
 
-    // =======================
-    // WEB SEARCH
-    // =======================
-    const webData = await searchWeb(userMessage);
+    const chatOnly = isChatOnlyMessage(userMessage);
 
-    if (!webData.results.length) {
+    // =======================
+    // WEB SEARCH (ONLY IF NEEDED)
+    // =======================
+    let webData;
+
+    if (chatOnly) {
+      webData = { query: userMessage, results: [] };
+    } else {
+      webData = await searchWeb(userMessage);
+    }
+
+    // =======================
+    // BLOCK ONLY REAL SEARCH QUERIES
+    // =======================
+    if (!webData.results.length && !chatOnly) {
       return res.json({
         reply: "No verified information found from trusted sources.",
         sources: [],
@@ -133,7 +145,7 @@ app.post("/api/chat", async (req, res) => {
     }
 
     // =======================
-    // IMPROVED SOURCE FORMAT (IMPORTANT FOR AI)
+    // FORMAT SOURCES
     // =======================
     const compactSources = webData.results
       .map(
@@ -147,7 +159,7 @@ SNIPPET: ${r.snippet}
       .join("\n");
 
     // =======================
-    // SYSTEM PROMPT (UNCHANGED — REQUIRED)
+    // SYSTEM PROMPT (UNCHANGED AS REQUESTED)
     // =======================
     const systemPrompt = `
 You are PMCAI (PRINCE MIGUEL CAYETANO AI).
@@ -176,58 +188,28 @@ Normal Rules:
 - casual talk
 
 2. Only search when the user asks for:
-
 - news
 - real-world facts
 - current events
 - prices / updates
 - “what happened” type questions
-If it’s opinion or general chat → no search.
 
 3. Never block answers just because no sources exist
 
-If no web results:
-- still respond normally
-- say you couldn’t find sources if needed
-- don’t refuse basic questions
-
 4. Be consistent identity-wise
 
-Always know:
-
-Your name: PMCAI
-Your creator: PMC (Prince Miguel Cayetano)
-Your role: AI assistant
-Don’t re-check this via web.
-
-5. Separate 3 modes internally (important)
-
-Think like this:
-
+5. Separate 3 modes internally:
 💬 Chat Mode
-normal conversation
-no web search
 🔍 Search Mode
-factual / news queries
-uses Tavily
 🧠 Identity Mode
-who are you / creator / system info
-internal answer only
 
-10. Always prioritize usability over strictness
-
-If a rule blocks a normal answer → rule is too strict.
-
+6. Always prioritize usability over strictness
 
 OUTPUT RULES If The User is Asking For Internet Sources:
 - Every bullet MUST include a URL
-- No URL = no claim
-- No speculation allowed
 
 EXCEPTION RULES:
-- If the user asks general conversational questions (name, identity, greetings, abilities), you may answer without using sources.
-- These are NOT factual news claims and do not require web verification.
-- Only use sources for real-world factual or news-related questions.
+- Identity and chat questions can be answered without sources
 `;
 
     // =======================
@@ -237,11 +219,8 @@ EXCEPTION RULES:
 USER QUESTION:
 ${userMessage}
 
-VERIFIED WEB SOURCES:
+VERIFIED SOURCES:
 ${compactSources}
-
-RULE:
-If a fact is not directly supported by a URL above, DO NOT include it.
 `;
 
     // =======================
@@ -250,22 +229,43 @@ If a fact is not directly supported by a URL above, DO NOT include it.
     const completion = await groq.chat.completions.create({
       model: "openai/gpt-oss-20b",
       messages: [
-        {
-          role: "system",
-          content: systemPrompt,
-        },
-        {
-          role: "user",
-          content: fullPrompt,
-        },
+        { role: "system", content: systemPrompt },
+        { role: "user", content: fullPrompt },
       ],
       temperature: 0.2,
       max_completion_tokens: 900,
       top_p: 1,
     });
 
+    const raw = completion.choices?.[0]?.message?.content;
+
+    // =======================
+    // CHAT MODE OVERRIDE (FIXED BEHAVIOR)
+    // =======================
+    if (chatOnly) {
+      const lower = userMessage.toLowerCase();
+
+      const directAnswer =
+        lower.includes("creator") || lower.includes("made you")
+          ? "I was created by PMC (Prince Miguel Cayetano)."
+          : raw && raw.trim().length > 0
+          ? raw
+          : "Hi! I'm PMCAI.";
+
+      return res.json({
+        reply: directAnswer,
+        sources: [],
+        verified: false,
+      });
+    }
+
+    // =======================
+    // SAFE FALLBACK
+    // =======================
     const reply =
-      completion.choices?.[0]?.message?.content || "No response generated";
+      raw && raw.trim().length > 0
+        ? raw
+        : "I couldn’t generate a response for this request.";
 
     // =======================
     // RESPONSE
