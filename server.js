@@ -4,7 +4,7 @@ import { Groq } from "groq-sdk";
 import rateLimit from "express-rate-limit";
 import fetch from "node-fetch";
 
-const URL = "https://pmcai-backend.onrender.com";
+const URL = "https://pmcai-backend.onrender.com/ping";
 
 const app = express();
 
@@ -299,9 +299,9 @@ app.listen(PORT, () => {
 
 setInterval(async () => {
   try {
-    await fetch(URL);
+    await fetch(URL, { method: "GET" });
     console.log("Self ping success");
   } catch (err) {
     console.log("Self ping failed");
   }
-}, 60 * 1000); // every 1 min
+}, 60 * 1000);
