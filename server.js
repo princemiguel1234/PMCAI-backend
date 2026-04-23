@@ -1,7 +1,6 @@
 import express from "express";
 import cors from "cors";
 import { Groq } from "groq-sdk";
-import fetch from "node-fetch";
 
 const app = express();
 
@@ -9,24 +8,33 @@ const app = express();
 // MIDDLEWARE
 // =======================
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
 
 // =======================
-// GROQ CLIENT (AI MODEL)
+// GROQ AI CLIENT
 // =======================
 const groq = new Groq({
-  apiKey: process.env.GROQ_API_KEY
+  apiKey: process.env.GROQ_API_KEY,
 });
 
 // =======================
-// ROOT
+// ROOT CHECK
 // =======================
 app.get("/", (req, res) => {
   res.send("PMCAI backend is running 🚀");
 });
 
 // =======================
-// 🌐 DUCKDUCKGO SEARCH (FREE INTERNET)
+// TIMEOUT HELPER (prevents hanging)
+// =======================
+function timeout(ms) {
+  return new Promise((_, reject) =>
+    setTimeout(() => reject(new Error("Timeout")), ms)
+  );
+}
+
+// =======================
+// 🌐 SIMPLE WEB SEARCH (DuckDuckGo Instant API)
 // =======================
 async function searchWeb(query) {
   try {
@@ -34,41 +42,34 @@ async function searchWeb(query) {
       query
     )}&format=json&no_html=1&skip_disambig=1`;
 
-    const res = await fetch(url);
+    const res = await Promise.race([
+      fetch(url),
+      timeout(5000),
+    ]);
+
     const data = await res.json();
 
-    let results = [];
+    // STRUCTURED OUTPUT (MUCH BETTER FOR AI)
+    const result = {
+      topic: data.Heading || null,
+      summary: data.AbstractText || null,
+      answer: data.Answer || null,
+      related: [],
+    };
 
-    // Main instant answer
-    if (data.AbstractText) {
-      results.push(`Summary: ${data.AbstractText}`);
+    if (data.RelatedTopics && Array.isArray(data.RelatedTopics)) {
+      result.related = data.RelatedTopics
+        .filter((t) => t.Text)
+        .slice(0, 5)
+        .map((t) => t.Text);
     }
 
-    if (data.Answer) {
-      results.push(`Answer: ${data.Answer}`);
-    }
-
-    if (data.Heading) {
-      results.push(`Topic: ${data.Heading}`);
-    }
-
-    // Related topics
-    if (data.RelatedTopics && data.RelatedTopics.length > 0) {
-      data.RelatedTopics.slice(0, 4).forEach((item) => {
-        if (item.Text) {
-          results.push(`Related: ${item.Text}`);
-        }
-      });
-    }
-
-    if (results.length === 0) {
-      return "No direct web data found. Use general knowledge.";
-    }
-
-    return results.join("\n");
+    return result;
   } catch (err) {
-    console.error("Search error:", err);
-    return "Web search failed. Use general knowledge.";
+    return {
+      error: true,
+      message: "Web search failed or unavailable",
+    };
   }
 }
 
@@ -84,20 +85,29 @@ app.post("/api/chat", async (req, res) => {
     }
 
     // =======================
-    // INTERNET CONTEXT
+    // GET WEB DATA
     // =======================
     const webData = await searchWeb(userMessage);
 
+    // =======================
+    // BUILD CLEAN PROMPT
+    // =======================
     const fullPrompt = `
 USER QUESTION:
 ${userMessage}
 
-WEB DATA:
-${webData}
+WEB CONTEXT (structured, may be empty or partial):
+${JSON.stringify(webData, null, 2)}
+
+INSTRUCTIONS:
+- Use web context if useful
+- If web context is weak, rely on reasoning
+- Do NOT copy raw text
+- Keep answer clear, helpful, and natural
 `;
 
     // =======================
-    // AI REQUEST (GPT-OSS 20B)
+    // GROQ REQUEST
     // =======================
     const completion = await groq.chat.completions.create({
       model: "openai/gpt-oss-20b",
@@ -108,32 +118,36 @@ ${webData}
 You are PMCAI, an AI assistant created by Prince Miguel Cayetano.
 
 Rules:
-- Use WEB DATA when provided
-- Summarize it naturally (DO NOT copy raw text)
-- If web data is weak, use your own knowledge
-- Be clear, accurate, and helpful
-`
+- Be accurate and helpful
+- Use web context when available
+- If web data is missing, rely on reasoning
+- Keep responses natural and structured
+`,
         },
         {
           role: "user",
-          content: fullPrompt
-        }
+          content: fullPrompt,
+        },
       ],
       temperature: 0.7,
       max_completion_tokens: 1024,
-      top_p: 1
+      top_p: 1,
     });
 
     const reply =
-      completion.choices?.[0]?.message?.content || "No response generated";
+      completion.choices?.[0]?.message?.content ||
+      "No response generated";
 
-    res.json({ reply });
+    res.json({
+      reply,
+      webUsed: !webData.error,
+    });
   } catch (err) {
     console.error("Backend Error:", err);
 
     res.status(500).json({
       error: "AI request failed",
-      details: err.message
+      details: err.message,
     });
   }
 });
