@@ -25,95 +25,40 @@ app.get("/", (req, res) => {
 });
 
 // =======================
-// TIMEOUT WRAPPER
-// =======================
-const timeout = (ms) =>
-  new Promise((_, reject) =>
-    setTimeout(() => reject(new Error("Timeout")), ms)
-  );
-
-// =======================
-// 🌐 BETTER WEB ENGINE (DuckDuckGo + Wikipedia fallback)
+// 🌐 TAVILY WEB SEARCH ENGINE
 // =======================
 async function searchWeb(query) {
   try {
-    // 1. DuckDuckGo Instant API
-    const ddgUrl = `https://api.duckduckgo.com/?q=${encodeURIComponent(
-      query
-    )}&format=json&no_html=1&skip_disambig=1`;
+    const res = await fetch("https://api.tavily.com/search", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${process.env.TAVILY_API_KEY}`,
+      },
+      body: JSON.stringify({
+        query,
+        search_depth: "basic",
+        include_answer: true,
+        include_raw_content: false,
+        max_results: 5,
+      }),
+    });
 
-    const ddgRes = await fetch(ddgUrl);
-    const ddg = await ddgRes.json();
+    const data = await res.json();
 
-    let results = {
-      query,
-      sources: [],
+    return {
+      answer: data.answer || null,
+      results: (data.results || []).map((r) => ({
+        title: r.title,
+        url: r.url,
+        snippet: r.content,
+      })),
     };
-
-    // =======================
-    // DDG DATA
-    // =======================
-    if (ddg.Heading) {
-      results.sources.push({
-        type: "topic",
-        text: ddg.Heading,
-      });
-    }
-
-    if (ddg.AbstractText) {
-      results.sources.push({
-        type: "summary",
-        text: ddg.AbstractText,
-      });
-    }
-
-    if (ddg.Answer) {
-      results.sources.push({
-        type: "answer",
-        text: ddg.Answer,
-      });
-    }
-
-    if (ddg.RelatedTopics?.length) {
-      ddg.RelatedTopics.slice(0, 5).forEach((t) => {
-        if (t.Text) {
-          results.sources.push({
-            type: "related",
-            text: t.Text,
-          });
-        }
-      });
-    }
-
-    // =======================
-    // WIKIPEDIA FALLBACK (IMPORTANT IMPROVEMENT)
-    // =======================
-    if (!ddg.AbstractText) {
-      const wikiUrl = `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(
-        query
-      )}`;
-
-      try {
-        const wikiRes = await fetch(wikiUrl);
-        const wiki = await wikiRes.json();
-
-        if (wiki.extract) {
-          results.sources.push({
-            type: "wiki",
-            text: wiki.extract,
-          });
-        }
-      } catch (e) {
-        // ignore wiki failure
-      }
-    }
-
-    return results;
   } catch (err) {
     return {
+      answer: null,
+      results: [],
       error: true,
-      message: "Web search failed",
-      sources: [],
     };
   }
 }
@@ -130,38 +75,37 @@ app.post("/api/chat", async (req, res) => {
     }
 
     // =======================
-    // GET WEB DATA
+    // GET REAL WEB DATA
     // =======================
     const webData = await searchWeb(userMessage);
 
     // =======================
-    // STRICT ANTI-HALLUCINATION RULES
+    // STRICT SYSTEM PROMPT
     // =======================
     const systemPrompt = `
 You are PMCAI, an AI assistant created by Prince Miguel Cayetano.
 
 CRITICAL RULES:
-- ONLY use WEB SOURCES if they exist
-- DO NOT invent news, dates, events, or products
-- If no real data exists, say "No verified information found"
-- NEVER create fake future events
-- Summarize only real provided data
-- Be concise and accurate
+- Use ONLY provided WEB DATA for factual claims
+- NEVER invent news, events, or dates
+- If WEB DATA is empty, say "No verified information found"
+- Summarize results clearly and naturally
+- Always prefer accuracy over creativity
 `;
 
     // =======================
-    // CLEAN CONTEXT
+    // FINAL PROMPT
     // =======================
     const fullPrompt = `
 USER QUESTION:
 ${userMessage}
 
-WEB SOURCES (use ONLY this, do not hallucinate):
+WEB DATA (REAL SEARCH RESULTS):
 ${JSON.stringify(webData, null, 2)}
 `;
 
     // =======================
-    // GROQ REQUEST
+    // GROQ AI REQUEST
     // =======================
     const completion = await groq.chat.completions.create({
       model: "openai/gpt-oss-20b",
@@ -175,7 +119,7 @@ ${JSON.stringify(webData, null, 2)}
           content: fullPrompt,
         },
       ],
-      temperature: 0.4, // lower = less hallucination
+      temperature: 0.3,
       max_completion_tokens: 1024,
       top_p: 1,
     });
@@ -184,10 +128,13 @@ ${JSON.stringify(webData, null, 2)}
       completion.choices?.[0]?.message?.content ||
       "No response generated";
 
+    // =======================
+    // RESPONSE
+    // =======================
     res.json({
       reply,
-      hasWeb: !webData.error,
-      sources: webData.sources || [],
+      webUsed: !webData.error,
+      sources: webData.results || [],
     });
   } catch (err) {
     console.error("Backend Error:", err);
