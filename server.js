@@ -5,10 +5,19 @@ import rateLimit from "express-rate-limit";
 import fetch from "node-fetch";
 
 const app = express();
-const URL = "https://pmcai-backend.onrender.com/ping";
+const PING_URL = "https://pmcai-backend.onrender.com/ping";
 
 // =======================
-// MEMORY STORE (SIMPLE BUT STABLE)
+// 🔥 HARD IDENTITY (IMMUTABLE TRUTH LAYER)
+// =======================
+const IDENTITY = {
+  aiName: "PMCAI",
+  creator: "PMC (Prince Miguel Cayetano)",
+  creatorInfo: "PMC is a normal dude",
+};
+
+// =======================
+// MEMORY STORE
 // =======================
 const memoryStore = new Map();
 
@@ -21,14 +30,16 @@ app.use(express.json({ limit: "1mb" }));
 // =======================
 // RATE LIMIT
 // =======================
-const limiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 20,
-});
-app.use("/api/chat", limiter);
+app.use(
+  "/api/chat",
+  rateLimit({
+    windowMs: 60 * 1000,
+    max: 20,
+  })
+);
 
 // =======================
-// GROQ CLIENT
+// GROQ
 // =======================
 const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY,
@@ -42,58 +53,31 @@ app.get("/", (req, res) => {
 });
 
 // =======================
-// BLOCKED DOMAINS
-// =======================
-const BLOCKED_DOMAINS = [
-  "instagram.com",
-  "tiktok.com",
-  "facebook.com",
-  "youtube.com",
-  "reddit.com",
-];
-
-// =======================
-// VALID SOURCE CHECK
-// =======================
-function isValidSource(url = "") {
-  try {
-    const hostname = new URL(url).hostname.replace("www.", "");
-    return !BLOCKED_DOMAINS.some(
-      (b) => hostname === b || hostname.endsWith("." + b)
-    );
-  } catch {
-    return false;
-  }
-}
-
-// =======================
-// INTENT DETECTION (FIXED)
+// CHAT DETECTOR
 // =======================
 function isChatOnlyMessage(msg = "") {
-  return /^(hello|hi|hey|lol|what is your name|who are you|creator|who made you)$/i.test(
-    msg.trim()
+  return /^(hello|hi|hey|lol|what is your name|who are you|creator|who made you|owner)$/i.test(
+    msg.trim().toLowerCase()
   );
 }
 
 // =======================
-// MEMORY FUNCTIONS
+// MEMORY
 // =======================
-function getMemory(userId) {
-  return memoryStore.get(userId) || [];
+function getMemory(id) {
+  return memoryStore.get(id) || [];
 }
 
-function addMemory(userId, msg) {
-  if (!memoryStore.has(userId)) memoryStore.set(userId, []);
-  memoryStore.get(userId).push(msg);
+function addMemory(id, text) {
+  if (!memoryStore.has(id)) memoryStore.set(id, []);
+  const mem = memoryStore.get(id);
 
-  // limit memory size (prevents spam RAM leak)
-  if (memoryStore.get(userId).length > 20) {
-    memoryStore.get(userId).shift();
-  }
+  mem.push(text);
+  if (mem.length > 25) mem.shift();
 }
 
 // =======================
-// WEB SEARCH
+// WEB SEARCH (SAFE)
 // =======================
 async function searchWeb(query) {
   try {
@@ -105,23 +89,17 @@ async function searchWeb(query) {
       },
       body: JSON.stringify({
         query,
-        search_depth: "basic",
-        include_answer: false,
-        max_results: 6,
+        max_results: 5,
       }),
     });
 
     const data = await res.json();
 
-    const results = (data.results || [])
-      .filter((r) => r.url && isValidSource(r.url))
-      .map((r) => ({
-        title: r.title,
-        url: r.url,
-        snippet: (r.content || "").slice(0, 180),
-      }));
-
-    return results;
+    return (data.results || []).map((r) => ({
+      title: r.title,
+      url: r.url,
+      snippet: (r.content || "").slice(0, 180),
+    }));
   } catch {
     return [];
   }
@@ -139,41 +117,26 @@ app.post("/api/chat", async (req, res) => {
       return res.status(400).json({ error: "No message provided" });
     }
 
+    const lower = userMessage.toLowerCase();
     const chatOnly = isChatOnlyMessage(userMessage);
 
     // =======================
-    // MEMORY UPDATE
+    // MEMORY
     // =======================
     addMemory(userId, `User: ${userMessage}`);
-
     const memory = getMemory(userId).join("\n");
 
     // =======================
-    // WEB ONLY WHEN NEEDED
-    // =======================
-    let webResults = [];
-
-    if (!chatOnly && req.body.useWeb === true) {
-      webResults = await searchWeb(userMessage);
-    }
-
-    // =======================
-    // CHAT MODE FIX (NO GLITCH LOOP)
+    // CHAT MODE (FAST RESPONSES)
     // =======================
     if (chatOnly) {
-      const lower = userMessage.toLowerCase();
-
       let reply = "Hi! I'm PMCAI.";
 
-      if (lower.includes("creator") || lower.includes("made you")) {
-        reply = "I was created by PMC (Prince Miguel Cayetano).";
-      }
-
-      if (lower === "hello" || lower === "hi") {
+      if (lower.includes("creator") || lower.includes("owner") || lower.includes("made you")) {
+        reply = `I was created by ${IDENTITY.creator}. ${IDENTITY.creatorInfo}`;
+      } else if (lower === "hello" || lower === "hi") {
         reply = "Hello!";
-      }
-
-      if (lower === "lol") {
+      } else if (lower === "lol") {
         reply = "lol";
       }
 
@@ -185,58 +148,53 @@ app.post("/api/chat", async (req, res) => {
     }
 
     // =======================
-    // STRICT MODE: NO FAKE DATA
+    // WEB (OPTIONAL)
     // =======================
-    if (!webResults.length && !chatOnly && req.body.useWeb === true) {
-      return res.json({
-        reply: "No verified information found from trusted sources.",
-        sources: [],
-        verified: false,
-      });
+    let webResults = [];
+
+    if (req.body.useWeb === true) {
+      webResults = await searchWeb(userMessage);
     }
 
-    // =======================
-    // FORMAT SOURCES
-    // =======================
-    const sourcesText = webResults
-      .map(
-        (r, i) => `
+    const sourcesText = webResults.length
+      ? webResults
+          .map(
+            (r, i) => `
 SOURCE ${i + 1}
 TITLE: ${r.title}
 URL: ${r.url}
 SNIPPET: ${r.snippet}
 `
-      )
-      .join("\n");
+          )
+          .join("\n")
+      : "No web sources provided. Use internal knowledge.";
 
     // =======================
-    // SYSTEM PROMPT (CLEANED)
+    // SYSTEM PROMPT (CLEAN + STABLE)
     // =======================
     const systemPrompt = `
-You are PMCAI (Prince Miguel Cayetano AI).
-You are a Cloud AI assistant.
-Your Creator Is PMC (Prince Miguel Cayetano)
-Your Creator Is Just a Chill Dude
+You are PMCAI.
+
+HARD IDENTITY (DO NOT CHANGE):
+- Name: ${IDENTITY.aiName}
+- Creator: ${IDENTITY.creator}
+- Creator Info: ${IDENTITY.creatorInfo}
 
 RULES:
-- Be accurate and consistent
-- Do NOT invent facts
-- Use provided sources when available
-- If no source exists, say it cannot be verified
-- Do not repeat identical answers unnecessarily
-- Always stay helpful and direct
+- Always answer clearly
+- Use web sources if provided
+- If no sources exist, use internal knowledge confidently
+- Do NOT refuse normal knowledge questions (Einstein, science, history)
+- Never say "I cannot confirm" for basic facts
+- Keep responses natural and helpful
 
-MODES:
-Chat Mode: normal conversation
-Search Mode: only when web data is provided
-Identity Mode: questions about PMCAI or creator
-
-PRIORITY:
-Accuracy > Creativity > Guessing
+BEHAVIOR:
+- If unsure: say "I may be wrong, but..."
+- Prioritize usefulness over strict refusal
 `;
 
     // =======================
-    // USER PROMPT
+    // MEMORY + INPUT
     // =======================
     const fullPrompt = `
 USER:
@@ -250,7 +208,7 @@ ${sourcesText}
 `;
 
     // =======================
-    // GROQ CALL
+    // AI CALL
     // =======================
     const completion = await groq.chat.completions.create({
       model: "openai/gpt-oss-20b",
@@ -258,7 +216,7 @@ ${sourcesText}
         { role: "system", content: systemPrompt },
         { role: "user", content: fullPrompt },
       ],
-      temperature: 0.2,
+      temperature: 0.3,
       max_completion_tokens: 900,
       top_p: 1,
     });
@@ -295,11 +253,8 @@ ${sourcesText}
 // =======================
 setInterval(async () => {
   try {
-    await fetch(URL);
-    console.log("Self ping success");
-  } catch {
-    console.log("Self ping failed");
-  }
+    await fetch(PING_URL);
+  } catch {}
 }, 60000);
 
 // =======================
