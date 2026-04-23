@@ -171,6 +171,11 @@ OUTPUT RULES:
 - Every bullet MUST include a URL
 - No URL = no claim
 - No speculation allowed
+
+EXCEPTION RULES:
+- If the user asks general conversational questions (name, identity, greetings, abilities), you may answer without using sources.
+- These are NOT factual news claims and do not require web verification.
+- Only use sources for real-world factual or news-related questions.
 `;
 
     // =======================
