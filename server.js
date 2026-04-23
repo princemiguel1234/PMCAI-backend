@@ -8,7 +8,7 @@ const app = express();
 const PING_URL = "https://pmcai-backend.onrender.com/ping";
 
 // =======================
-// 🔥 HARD IDENTITY (IMMUTABLE TRUTH LAYER)
+// 🔥 HARD IDENTITY
 // =======================
 const IDENTITY = {
   aiName: "PMCAI",
@@ -77,7 +77,7 @@ function addMemory(id, text) {
 }
 
 // =======================
-// WEB SEARCH (SAFE)
+// 🌐 WEB SEARCH (UPGRADED)
 // =======================
 async function searchWeb(query) {
   try {
@@ -89,16 +89,17 @@ async function searchWeb(query) {
       },
       body: JSON.stringify({
         query,
-        max_results: 5,
+        max_results: 7,
+        include_answer: true,
       }),
     });
 
     const data = await res.json();
 
     return (data.results || []).map((r) => ({
-      title: r.title,
-      url: r.url,
-      snippet: (r.content || "").slice(0, 180),
+      title: r.title || "No title",
+      url: r.url || "No URL",
+      snippet: (r.content || "").slice(0, 220),
     }));
   } catch {
     return [];
@@ -127,7 +128,7 @@ app.post("/api/chat", async (req, res) => {
     const memory = getMemory(userId).join("\n");
 
     // =======================
-    // CHAT MODE (FAST RESPONSES)
+    // CHAT MODE
     // =======================
     if (chatOnly) {
       let reply = "Hi! I'm PMCAI.";
@@ -148,7 +149,7 @@ app.post("/api/chat", async (req, res) => {
     }
 
     // =======================
-    // WEB (OPTIONAL)
+    // WEB MODE
     // =======================
     let webResults = [];
 
@@ -156,7 +157,9 @@ app.post("/api/chat", async (req, res) => {
       webResults = await searchWeb(userMessage);
     }
 
-    const sourcesText = webResults.length
+    const hasWeb = webResults.length > 0;
+
+    const sourcesText = hasWeb
       ? webResults
           .map(
             (r, i) => `
@@ -167,67 +170,74 @@ SNIPPET: ${r.snippet}
 `
           )
           .join("\n")
-      : "No web sources provided. Use internal knowledge.";
+      : "No web sources provided.";
 
     // =======================
-    // SYSTEM PROMPT (CLEAN + STABLE)
+    // SYSTEM PROMPT (UPGRADED INTERNET AWARE)
     // =======================
     const systemPrompt = `
 You are PMCAI.
-HARD IDENTITY (DO NOT CHANGE):
+
+HARD IDENTITY:
 Name: ${IDENTITY.aiName}
 Creator: ${IDENTITY.creator}
 Creator Info: ${IDENTITY.creatorInfo}
-CORE TRUTH RULES:
-Prioritize accuracy over confidence
-Never present unverified information as fact
-Do not guess missing details
-Do not fabricate:
-dates
-product specs/features
-releases or announcements
-statistics
-scientific claims
-company updates
-If information is uncertain, clearly label it:
-“Not confirmed”
-“No reliable source available”
-"This is unclear or not established”
-KNOWLEDGE HANDLING:
-Use provided web sources when available
-If no sources are provided:
-answer using general, well-known knowledge only
-avoid specific numbers, dates, or claims unless widely established
-Do NOT invent details to “complete” an answer
-GENERAL QUESTIONS RULE:
-Do NOT refuse normal knowledge topics (science, history, math, general facts)
-But DO keep answers within known, established information
-If detail level is uncertain, simplify instead of guessing
-UNCERTAINTY BEHAVIOR:
-Never say false certainty
-If unsure, respond with:
-“Based on what is generally known...”
-“This is not clearly confirmed, but...”
-or “There is no solid information on this”
-Do NOT use phrases like “I cannot confirm” for basic general knowledge
-RESPONSE STYLE:
-Clear, helpful, and natural
-No over-explaining uncertainty
-No exaggeration or hype language
-Focus on giving the best safe answer, not the most detailed guess
+
+---
+
+🌐 INTERNET RULES:
+
+If SOURCES exist:
+- You are in INTERNET MODE
+- Sources are PRIMARY TRUTH
+- Do NOT ignore or override them
+- Only summarize from sources
+- If sources are weak → say so clearly
+
+If NO SOURCES exist:
+- You are in OFFLINE MODE
+- Use general knowledge only
+- Do NOT pretend to have live data
+
+---
+
+🚨 TRUTH RULES:
+- Never fabricate facts
+- Never invent news, stats, releases, or claims
+- If unsure:
+  → Not confirmed
+  → No reliable info available
+  → Unclear
+
+---
+
+🧠 BEHAVIOR:
+- Internet Mode > Offline Mode
+- Sources always override memory
+- Do not mix guessing with web data
+
+---
+
+STYLE:
+- Clear, direct, helpful
+- No hype
+- No fake certainty
 `;
 
     // =======================
-    // MEMORY + INPUT
+    // PROMPT INPUT
     // =======================
     const fullPrompt = `
-USER:
+USER QUESTION:
 ${userMessage}
+
+MODE:
+${hasWeb ? "INTERNET MODE (USE SOURCES)" : "OFFLINE MODE"}
 
 MEMORY:
 ${memory}
 
-SOURCES:
+WEB SOURCES:
 ${sourcesText}
 `;
 
@@ -250,7 +260,7 @@ ${sourcesText}
       "I couldn't generate a response.";
 
     // =======================
-    // SAVE AI MEMORY
+    // SAVE MEMORY
     // =======================
     addMemory(userId, `PMCAI: ${reply}`);
 
@@ -260,7 +270,7 @@ ${sourcesText}
     res.json({
       reply,
       sources: webResults,
-      verified: webResults.length > 0,
+      verified: hasWeb,
     });
   } catch (err) {
     console.error("PMCAI ERROR:", err);
