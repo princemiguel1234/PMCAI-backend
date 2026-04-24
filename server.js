@@ -100,9 +100,9 @@ app.post("/api/chat", rateLimit({ windowMs: 60000, max: 25 }), async (req, res) 
     }
 
     // 3. Build System Instructions
-    const systemPrompt = `You are ${IDENTITY.aiName}, a highly advanced AI created by ${IDENTITY.creator}. 
+    const systemPrompt = `You are ${IDENTITY.aiName}, a Normal AI created by ${IDENTITY.creator}. 
     Your tone is direct, helpful, and concise. Do not use reasoning tags or headers like "processed". 
-    If internet data is provided, use it to ensure accuracy.`;
+    If internet data is provided, use it to ensure accuracy.${IDENTITY.creator} is a Normal Guy.`;
 
     // 4. Create Message Array
     const payload = [
