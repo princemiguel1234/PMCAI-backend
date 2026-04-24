@@ -3,113 +3,29 @@ import cors from "cors";
 import { Groq } from "groq-sdk";
 import rateLimit from "express-rate-limit";
 import fetch from "node-fetch";
-import "dotenv/config"; // ✅ Automatically loads .env variables if running locally
+import "dotenv/config";
 
 const app = express();
-
-// ✅ CRITICAL FOR RENDER: Allows rate-limiter and req.ip to see the real user's IP
-app.set("trust proxy", 1); 
-
-const PING_URL = "https://pmcai-backend.onrender.com/ping";
+app.set("trust proxy", 1);
 
 // =======================
-// 🔥 IDENTITY
+// ⚙️ CONFIGURATION
 // =======================
+const USER_MODEL = "llama-3.3-70b-versatile"; 
+const WAKEUP_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"; // Terminal Only
+
 const IDENTITY = {
   aiName: "PMCAI",
-  creator: "PMC (Prince Miguel Cayetano)",
-  creatorInfo: "PMC is a normal dude",
+  creator: "Prince Miguel Cayetano"
 };
 
-const GROQ_MODEL = "llama-3.3-70b-versatile";
-
-// =======================
-// 🧠 MEMORY (25 LIMIT)
-// =======================
 const memoryStore = new Map();
-
-function getMemory(id) {
-  return memoryStore.get(id) || [];
-}
-
-function addMemory(id, user, assistant) {
-  if (!memoryStore.has(id)) memoryStore.set(id, []);
-  const mem = memoryStore.get(id);
-
-  mem.push({ user, assistant });
-
-  // Keep only the last 25 interactions
-  while (mem.length > 25) mem.shift();
-}
-
-// =======================
-// ⚙️ MIDDLEWARE
-// =======================
-app.use(cors());
-app.use(express.json({ limit: "1mb" }));
-
-app.use(
-  "/api/chat",
-  rateLimit({
-    windowMs: 60 * 1000,
-    max: 25,
-    standardHeaders: true,
-    legacyHeaders: false,
-    message: { error: "Too many requests. Please slow down." }
-  })
-);
-
-// =======================
-// 🔑 GROQ CLIENTS (SMART FALLBACK)
-// =======================
-function getGroqClients() {
-  const keys = [
-    process.env.GROQ_API_KEY1,
-    process.env.GROQ_API_KEY2,
-    process.env.GROQ_API_KEY3,
-  ].filter(Boolean);
-
-  if (keys.length === 0) {
-    console.warn("⚠️ WARNING: No Groq API keys found in environment variables!");
-  }
-
-  return keys.map((apiKey) => new Groq({ apiKey }));
-}
-
-function shouldRetryGroqError(err) {
-  const status = err?.status || err?.response?.status;
-  return !status || [408, 429, 500, 502, 503, 504].includes(status);
-}
-
-async function groqChatWithFallback(params) {
-  const clients = getGroqClients();
-  if (!clients.length) throw new Error("No Groq API keys configured on server.");
-
-  let lastError;
-
-  for (const client of clients) {
-    try {
-      const res = await client.chat.completions.create(params);
-      if (res?.choices?.length) return res;
-    } catch (err) {
-      lastError = err;
-      if (!shouldRetryGroqError(err)) throw err;
-      console.log(`Switching to backup Groq key due to error: ${err.status}`);
-    }
-  }
-
-  throw lastError;
-}
 
 // =======================
 // 🌐 WEB SEARCH
 // =======================
 async function searchWeb(query) {
-  if (!process.env.TAVILY_API_KEY) {
-    console.warn("⚠️ Tavily API key missing. Skipping web search.");
-    return [];
-  }
-
+  if (!process.env.TAVILY_API_KEY) return "";
   try {
     const res = await fetch("https://api.tavily.com/search", {
       method: "POST",
@@ -117,159 +33,89 @@ async function searchWeb(query) {
         "Content-Type": "application/json",
         Authorization: `Bearer ${process.env.TAVILY_API_KEY}`,
       },
-      body: JSON.stringify({
-        query,
-        max_results: 5,
-        include_answer: true,
-      }),
+      body: JSON.stringify({ query, max_results: 3 }),
     });
-
-    if (!res.ok) return [];
-
     const data = await res.json();
-    return (data.results || []).map((r) => ({
-      title: r.title || "No title",
-      url: r.url || "No URL",
-      snippet: (r.content || "").slice(0, 180),
-    }));
-  } catch (err) {
-    console.error("Search Error:", err.message);
-    return [];
-  }
+    return (data.results || []).map(r => `Source: ${r.title}\nContent: ${r.content}`).join("\n\n");
+  } catch { return ""; }
 }
 
 // =======================
-// 💬 CHAT DETECTOR
+// 💬 USER CHAT (LLAMA 3.3)
 // =======================
-function isChatOnlyMessage(msg = "") {
-  return /^(hello|hi|hey|lol|what is your name|who are you|creator|owner|who made you)$/i.test(msg.trim());
-}
+app.use(cors());
+app.use(express.json());
 
-// =======================
-// 🏠 ROUTES
-// =======================
-app.get("/", (req, res) => {
-  res.send("PMCAI RUNNING 🚀");
-});
-
-app.get("/ping", (req, res) => {
-  res.send("pong");
-});
-
-// =======================
-// 💬 CHAT ENDPOINT
-// =======================
 app.post("/api/chat", async (req, res) => {
   try {
-    const userMessage = req.body.message?.trim();
+    const { message, useWeb } = req.body;
     const userId = req.ip;
+    if (!message) return res.status(400).json({ error: "No message" });
 
-    if (!userMessage) {
-      return res.status(400).json({ error: "No message provided" });
-    }
+    // 1. Get Memory
+    const history = memoryStore.get(userId) || [];
 
-    const lower = userMessage.toLowerCase();
-    const chatOnly = isChatOnlyMessage(userMessage);
+    // 2. Internet Context
+    let webContext = "";
+    if (useWeb) webContext = await searchWeb(message);
 
-    // =======================
-    // ⚡ SIMPLE CHAT MODE
-    // =======================
-    if (chatOnly) {
-      let reply = "Hi! I'm PMCAI.";
-      if (lower.includes("creator") || lower.includes("owner") || lower.includes("made you")) {
-        reply = `I was created by ${IDENTITY.creator}. ${IDENTITY.creatorInfo}`;
-      } else if (lower === "hello" || lower === "hi" || lower === "hey") {
-        reply = "Hello! How can I help you today?";
-      } else if (lower === "lol") {
-        reply = "Haha! What's on your mind?";
-      }
-      return res.json({ reply, sources: [], verified: false });
-    }
+    // 3. System Prompt
+    const systemPrompt = `You are ${IDENTITY.aiName} by ${IDENTITY.creator}. Use provided internet data to be accurate. Be direct.`;
 
-    // =======================
-    // 🌐 WEB SEARCH
-    // =======================
-    let webResults = [];
-    if (req.body.useWeb === true) {
-      webResults = await searchWeb(userMessage);
-    }
-
-    const sourcesText = webResults.length
-      ? "\n\nWeb Sources (Use these to help answer if relevant):\n" + webResults.map(r => `- ${r.title}: ${r.snippet} (${r.url})`).join("\n")
-      : "";
-
-    // =======================
-    // 🧠 ASSEMBLE MESSAGES (NATIVE MEMORY)
-    // =======================
-    const systemPrompt = `You are ${IDENTITY.aiName}, an AI created by ${IDENTITY.creator}. 
-Rules:
-- Do not over-explain. Be accurate and direct.
-- Base your answers on the provided Web Sources if available.`;
-
-    const messages = [{ role: "system", content: systemPrompt }];
-
-    // Inject native chat history
-    const memory = getMemory(userId);
-    for (const mem of memory) {
-      messages.push({ role: "user", content: mem.user });
-      messages.push({ role: "assistant", content: mem.assistant });
-    }
-
-    // Inject the current message + sources
-    messages.push({ role: "user", content: `${userMessage}${sourcesText}` });
-
-    // =======================
-    // 🤖 GROQ CALL
-    // =======================
-    const completion = await groqChatWithFallback({
-      model: GROQ_MODEL,
-      messages: messages,
-      temperature: 0.4,
-      max_tokens: 800,
-      top_p: 1,
+    // 4. Groq Call
+    const groq = new Groq({ apiKey: process.env.GROQ_API_KEY1 });
+    const completion = await groq.chat.completions.create({
+      model: USER_MODEL,
+      messages: [
+        { role: "system", content: systemPrompt },
+        ...history,
+        { role: "user", content: `${message}\n\nInternet Data: ${webContext}` }
+      ],
+      temperature: 0.7,
     });
 
-    let reply = completion.choices?.[0]?.message?.content || "I couldn't generate a response.";
+    const reply = completion.choices[0]?.message?.content;
 
-    // =======================
-    // 🛡️ FRONTEND FORMATTING (THINK TAGS)
-    // =======================
-    // If your frontend relies on <think> tags, we ensure they exist here.
-    if (!reply.includes("<think>")) {
-      reply = `<think>\nprocessed\n</think>\n\n${reply}`;
-    }
+    // 5. Update Memory (Only for User Model)
+    const newHistory = [...history, { role: "user", content: message }, { role: "assistant", content: reply }];
+    if (newHistory.length > 20) newHistory.splice(0, 2);
+    memoryStore.set(userId, newHistory);
 
-    // =======================
-    // 💾 SAVE MEMORY
-    // =======================
-    addMemory(userId, userMessage, reply);
+    // 6. Final Response (No <think> tags)
+    res.json({ reply, sources: useWeb ? [webContext] : [] });
 
-    res.json({
-      reply,
-      sources: webResults,
-      verified: webResults.length > 0,
-    });
   } catch (err) {
-    console.error("CHAT ERROR:", err.message);
-    res.status(500).json({ error: "Server error", details: err.message });
+    res.status(500).json({ error: "LLaMA 3 Error" });
   }
 });
 
 // =======================
-// 🔁 SELF PING (ANTI-SLEEP)
+// ⏰ AUTO-WAKEUP (LLAMA 4 SCOUT)
 // =======================
+// Runs every 10 minutes. Output is TERMINAL ONLY. No memory. No internet.
 setInterval(async () => {
+  console.log("--- Executing LLaMA 4 Scout Wakeup ---");
   try {
-    await fetch(PING_URL);
+    const groq = new Groq({ apiKey: process.env.GROQ_API_KEY1 });
+    const completion = await groq.chat.completions.create({
+      model: WAKEUP_MODEL,
+      messages: [
+        { role: "user", content: "Rebooting Server Dont say a sentence Just Say 1 Word" }
+      ],
+      max_tokens: 10,
+    });
+
+    const terminalReply = completion.choices[0]?.message?.content?.trim();
+    console.log(`[LLaMA 4 RESPONSE]: ${terminalReply}`);
   } catch (err) {
-    // Silently ignore ping errors to prevent console spam if offline
+    console.log("[LLaMA 4 ERROR]: Wakeup model failed or key invalid.");
   }
-}, 60000);
+}, 10 * 60 * 1000); // 10 Minutes
 
 // =======================
-// 🚀 START SERVER
+// 🚀 SERVER
 // =======================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🚀 PMCAI RUNNING ON PORT ${PORT}`);
+  console.log(`PMCAI Online. LLaMA 3.3 for Users | LLaMA 4 Scout for Terminal.`);
 });
