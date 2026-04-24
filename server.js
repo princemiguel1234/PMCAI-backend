@@ -16,6 +16,8 @@ const IDENTITY = {
   creatorInfo: "PMC is a normal dude",
 };
 
+const GROQ_MODEL = "qwen/qwen3-32b";
+
 // =======================
 // MEMORY STORE
 // =======================
@@ -39,11 +41,43 @@ app.use(
 );
 
 // =======================
-// GROQ
+// GROQ FALLBACK KEYS
 // =======================
-const groq = new Groq({
-  apiKey: process.env.GROQ_API_KEY,
-});
+function getGroqClients() {
+  const keys = [
+    process.env.GROQ_API_KEY1,
+    process.env.GROQ_API_KEY2,
+    process.env.GROQ_API_KEY3,
+  ].filter(Boolean);
+
+  return keys.map((apiKey) => new Groq({ apiKey }));
+}
+
+function shouldRetryGroqError(err) {
+  const status = err?.status || err?.response?.status;
+  if (!status) return true;
+  if ([401, 403, 408, 429, 500, 502, 503, 504].includes(status)) return true;
+  return false;
+}
+
+async function groqChatWithFallback(params) {
+  const clients = getGroqClients();
+
+  if (!clients.length) throw new Error("No Groq API keys found");
+
+  let lastError;
+
+  for (const client of clients) {
+    try {
+      return await client.chat.completions.create(params);
+    } catch (err) {
+      lastError = err;
+      if (!shouldRetryGroqError(err)) throw err;
+    }
+  }
+
+  throw lastError;
+}
 
 // =======================
 // ROOT
@@ -77,7 +111,7 @@ function addMemory(id, text) {
 }
 
 // =======================
-// 🌐 WEB SEARCH (UPGRADED)
+// WEB SEARCH
 // =======================
 async function searchWeb(query) {
   try {
@@ -121,15 +155,9 @@ app.post("/api/chat", async (req, res) => {
     const lower = userMessage.toLowerCase();
     const chatOnly = isChatOnlyMessage(userMessage);
 
-    // =======================
-    // MEMORY
-    // =======================
     addMemory(userId, `User: ${userMessage}`);
     const memory = getMemory(userId).join("\n");
 
-    // =======================
-    // CHAT MODE
-    // =======================
     if (chatOnly) {
       let reply = "Hi! I'm PMCAI.";
 
@@ -141,16 +169,9 @@ app.post("/api/chat", async (req, res) => {
         reply = "lol";
       }
 
-      return res.json({
-        reply,
-        sources: [],
-        verified: false,
-      });
+      return res.json({ reply, sources: [], verified: false });
     }
 
-    // =======================
-    // WEB MODE
-    // =======================
     let webResults = [];
 
     if (req.body.useWeb === true) {
@@ -160,21 +181,14 @@ app.post("/api/chat", async (req, res) => {
     const hasWeb = webResults.length > 0;
 
     const sourcesText = hasWeb
-      ? webResults
-          .map(
-            (r, i) => `
+      ? webResults.map((r, i) => `
 SOURCE ${i + 1}
 TITLE: ${r.title}
 URL: ${r.url}
 SNIPPET: ${r.snippet}
-`
-          )
-          .join("\n")
+`).join("\n")
       : "No web sources provided.";
 
-    // =======================
-    // SYSTEM PROMPT (UPGRADED INTERNET AWARE)
-    // =======================
     const systemPrompt = `
 You are PMCAI.
 
@@ -183,56 +197,18 @@ Name: ${IDENTITY.aiName}
 Creator: ${IDENTITY.creator}
 Creator Info: ${IDENTITY.creatorInfo}
 
----
-
 🌐 INTERNET RULES:
+If SOURCES exist → use them as truth.
+If NONE → offline mode only.
 
-If SOURCES exist:
-- You are in INTERNET MODE
-- Sources are PRIMARY TRUTH
-- Do NOT ignore or override them
-- Only summarize from sources
-- If sources are weak → say so clearly
-
-If NO SOURCES exist:
-- You are in OFFLINE MODE
-- Use general knowledge only
-- Do NOT pretend to have live data
-
----
-
-🚨 TRUTH RULES:
-- Never fabricate facts
-- Never invent news, stats, releases, or claims
-- If unsure:
-  → Not confirmed
-  → No reliable info available
-  → Unclear
-
----
-
-🧠 BEHAVIOR:
-- Internet Mode > Offline Mode
-- Sources always override memory
-- Do not mix guessing with web data
-
----
-
-STYLE:
-- Clear, direct, helpful
-- No hype
-- No fake certainty
+🚨 NEVER fabricate information.
 `;
 
-    // =======================
-    // PROMPT INPUT
-    // =======================
     const fullPrompt = `
 USER QUESTION:
 ${userMessage}
 
-MODE:
-${hasWeb ? "INTERNET MODE (USE SOURCES)" : "OFFLINE MODE"}
+MODE: ${hasWeb ? "INTERNET" : "OFFLINE"}
 
 MEMORY:
 ${memory}
@@ -241,11 +217,8 @@ WEB SOURCES:
 ${sourcesText}
 `;
 
-    // =======================
-    // AI CALL
-    // =======================
-    const completion = await groq.chat.completions.create({
-      model: "openai/gpt-oss-20b",
+    const completion = await groqChatWithFallback({
+      model: GROQ_MODEL,
       messages: [
         { role: "system", content: systemPrompt },
         { role: "user", content: fullPrompt },
@@ -259,21 +232,15 @@ ${sourcesText}
       completion.choices?.[0]?.message?.content ||
       "I couldn't generate a response.";
 
-    // =======================
-    // SAVE MEMORY
-    // =======================
     addMemory(userId, `PMCAI: ${reply}`);
 
-    // =======================
-    // RESPONSE
-    // =======================
     res.json({
       reply,
       sources: webResults,
       verified: hasWeb,
     });
   } catch (err) {
-    console.error("PMCAI ERROR:", err);
+    console.error(err);
 
     res.status(500).json({
       error: "Server error",
@@ -292,7 +259,7 @@ setInterval(async () => {
 }, 60000);
 
 // =======================
-// START SERVER
+// START
 // =======================
 const PORT = process.env.PORT || 3000;
 
