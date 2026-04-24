@@ -11,8 +11,9 @@ app.set("trust proxy", 1);
 // =======================
 // ⚙️ CONFIGURATION
 // =======================
-const USER_MODEL = "llama-3.3-70b-versatile"; 
-const WAKEUP_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"; // Terminal Only
+const PRIMARY_MODEL = "llama-3.3-70b-versatile";
+const SECONDARY_MODEL = "openai/gpt-oss-20"; // Fallback Intelligence
+const WAKEUP_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct";
 
 const IDENTITY = {
   aiName: "PMCAI",
@@ -41,81 +42,105 @@ async function searchWeb(query) {
 }
 
 // =======================
-// 💬 USER CHAT (LLAMA 3.3)
+// 🧠 INTELLIGENCE TIERING LOGIC
+// =======================
+async function getChatCompletion(messages) {
+  const groq = new Groq({ apiKey: process.env.GROQ_API_KEY1 });
+
+  try {
+    // --- TRY PRIMARY MODEL ---
+    console.log(`[Tier 1] Attempting Primary: ${PRIMARY_MODEL}`);
+    const primary = await groq.chat.completions.create({
+      model: PRIMARY_MODEL,
+      messages,
+      temperature: 0.7,
+    });
+    return { reply: primary.choices[0]?.message?.content, tier: "Primary" };
+
+  } catch (err) {
+    console.error(`[Tier 1 Error] Primary failed. Pivoting to Secondary...`);
+    
+    try {
+      // --- FALLBACK TO SECONDARY ---
+      const secondary = await groq.chat.completions.create({
+        model: SECONDARY_MODEL,
+        messages,
+        temperature: 0.6,
+      });
+      return { reply: secondary.choices[0]?.message?.content, tier: "Secondary" };
+
+    } catch (secErr) {
+      console.error(`[Tier 2 Error] Secondary also failed.`);
+      throw new Error("All intelligence tiers are currently unavailable.");
+    }
+  }
+}
+
+// =======================
+// 💬 USER CHAT ENDPOINT
 // =======================
 app.use(cors());
 app.use(express.json());
 
-app.post("/api/chat", async (req, res) => {
+app.post("/api/chat", rateLimit({ windowMs: 60000, max: 25 }), async (req, res) => {
   try {
     const { message, useWeb } = req.body;
     const userId = req.ip;
     if (!message) return res.status(400).json({ error: "No message" });
 
-    // 1. Get Memory
+    // 1. Context & Identity
     const history = memoryStore.get(userId) || [];
+    const webContext = useWeb ? await searchWeb(message) : "";
+    const systemPrompt = `You are ${IDENTITY.aiName} by ${IDENTITY.creator}. Be direct and accurate.`;
 
-    // 2. Internet Context
-    let webContext = "";
-    if (useWeb) webContext = await searchWeb(message);
+    const payload = [
+      { role: "system", content: systemPrompt },
+      ...history,
+      { role: "user", content: `${message}\n\nInternet Data: ${webContext}` }
+    ];
 
-    // 3. System Prompt
-    const systemPrompt = `You are ${IDENTITY.aiName} by ${IDENTITY.creator}. Use provided internet data to be accurate. Be direct.`;
+    // 2. Call Tiered Intelligence
+    const { reply, tier } = await getChatCompletion(payload);
 
-    // 4. Groq Call
-    const groq = new Groq({ apiKey: process.env.GROQ_API_KEY1 });
-    const completion = await groq.chat.completions.create({
-      model: USER_MODEL,
-      messages: [
-        { role: "system", content: systemPrompt },
-        ...history,
-        { role: "user", content: `${message}\n\nInternet Data: ${webContext}` }
-      ],
-      temperature: 0.7,
-    });
-
-    const reply = completion.choices[0]?.message?.content;
-
-    // 5. Update Memory (Only for User Model)
+    // 3. Save Memory
     const newHistory = [...history, { role: "user", content: message }, { role: "assistant", content: reply }];
     if (newHistory.length > 20) newHistory.splice(0, 2);
     memoryStore.set(userId, newHistory);
 
-    // 6. Final Response (No <think> tags)
-    res.json({ reply, sources: useWeb ? [webContext] : [] });
+    // 4. Response
+    res.json({ 
+      reply, 
+      sources: useWeb ? [webContext] : [],
+      meta: { model_used: tier } 
+    });
 
   } catch (err) {
-    res.status(500).json({ error: "LLaMA 3 Error" });
+    res.status(500).json({ error: "Intelligence failure", details: err.message });
   }
 });
 
 // =======================
 // ⏰ AUTO-WAKEUP (LLAMA 4 SCOUT)
 // =======================
-// Runs every 10 minutes. Output is TERMINAL ONLY. No memory. No internet.
 setInterval(async () => {
   console.log("--- Executing LLaMA 4 Scout Wakeup ---");
   try {
     const groq = new Groq({ apiKey: process.env.GROQ_API_KEY1 });
     const completion = await groq.chat.completions.create({
       model: WAKEUP_MODEL,
-      messages: [
-        { role: "user", content: "Rebooting Server Dont say a sentence Just Say 1 Word" }
-      ],
+      messages: [{ role: "user", content: "Rebooting Server Dont say a sentence Just Say 1 Word" }],
       max_tokens: 10,
     });
-
-    const terminalReply = completion.choices[0]?.message?.content?.trim();
-    console.log(`[LLaMA 4 RESPONSE]: ${terminalReply}`);
+    console.log(`[LLaMA 4 RESPONSE]: ${completion.choices[0]?.message?.content?.trim()}`);
   } catch (err) {
-    console.log("[LLaMA 4 ERROR]: Wakeup model failed or key invalid.");
+    console.log("[LLaMA 4 ERROR]: Heartbeat failed.");
   }
-}, 10 * 60 * 1000); // 10 Minutes
+}, 10 * 60 * 1000);
 
 // =======================
 // 🚀 SERVER
 // =======================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`PMCAI Online. LLaMA 3.3 for Users | LLaMA 4 Scout for Terminal.`);
+  console.log(`PMCAI Ready. Tiering: ${PRIMARY_MODEL} -> ${SECONDARY_MODEL}`);
 });
