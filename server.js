@@ -12,7 +12,7 @@ app.set("trust proxy", 1);
 // ⚙️ CONFIGURATION
 // =======================
 const PRIMARY_MODEL = "llama-3.3-70b-versatile";
-const SECONDARY_MODEL = "openai/gpt-oss-20"; // Fallback Intelligence
+const SECONDARY_MODEL = "openai/gpt-oss-20"; 
 const WAKEUP_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct";
 
 const IDENTITY = {
@@ -20,10 +20,11 @@ const IDENTITY = {
   creator: "Prince Miguel Cayetano"
 };
 
+// Memory store to keep track of conversations per User IP
 const memoryStore = new Map();
 
 // =======================
-// 🌐 WEB SEARCH
+// 🌐 WEB SEARCH (TAVILY)
 // =======================
 async function searchWeb(query) {
   if (!process.env.TAVILY_API_KEY) return "";
@@ -42,14 +43,14 @@ async function searchWeb(query) {
 }
 
 // =======================
-// 🧠 INTELLIGENCE TIERING LOGIC
+// 🧠 INTELLIGENCE TIERING (NO <THINK> TAGS)
 // =======================
 async function getChatCompletion(messages) {
   const groq = new Groq({ apiKey: process.env.GROQ_API_KEY1 });
 
   try {
     // --- TRY PRIMARY MODEL ---
-    console.log(`[Tier 1] Attempting Primary: ${PRIMARY_MODEL}`);
+    console.log(`[Tier 1] Requesting Primary: ${PRIMARY_MODEL}`);
     const primary = await groq.chat.completions.create({
       model: PRIMARY_MODEL,
       messages,
@@ -71,7 +72,7 @@ async function getChatCompletion(messages) {
 
     } catch (secErr) {
       console.error(`[Tier 2 Error] Secondary also failed.`);
-      throw new Error("All intelligence tiers are currently unavailable.");
+      throw new Error("All intelligence tiers are currently offline.");
     }
   }
 }
@@ -86,35 +87,47 @@ app.post("/api/chat", rateLimit({ windowMs: 60000, max: 25 }), async (req, res) 
   try {
     const { message, useWeb } = req.body;
     const userId = req.ip;
-    if (!message) return res.status(400).json({ error: "No message" });
 
-    // 1. Context & Identity
+    if (!message) return res.status(400).json({ error: "No message provided" });
+
+    // 1. Get Conversation History
     const history = memoryStore.get(userId) || [];
-    const webContext = useWeb ? await searchWeb(message) : "";
-    const systemPrompt = `You are ${IDENTITY.aiName} by ${IDENTITY.creator}. Be direct and accurate.`;
 
+    // 2. Fetch Internet Data if requested
+    let webContext = "";
+    if (useWeb) {
+      webContext = await searchWeb(message);
+    }
+
+    // 3. Build System Instructions
+    const systemPrompt = `You are ${IDENTITY.aiName}, a highly advanced AI created by ${IDENTITY.creator}. 
+    Your tone is direct, helpful, and concise. Do not use reasoning tags or headers like "processed". 
+    If internet data is provided, use it to ensure accuracy.`;
+
+    // 4. Create Message Array
     const payload = [
       { role: "system", content: systemPrompt },
       ...history,
-      { role: "user", content: `${message}\n\nInternet Data: ${webContext}` }
+      { role: "user", content: webContext ? `INTERNET DATA:\n${webContext}\n\nUSER QUESTION:\n${message}` : message }
     ];
 
-    // 2. Call Tiered Intelligence
+    // 5. Get AI Response (Clean)
     const { reply, tier } = await getChatCompletion(payload);
 
-    // 3. Save Memory
-    const newHistory = [...history, { role: "user", content: message }, { role: "assistant", content: reply }];
-    if (newHistory.length > 20) newHistory.splice(0, 2);
-    memoryStore.set(userId, newHistory);
+    // 6. Update Memory (Limit to last 10 interactions)
+    const updatedHistory = [...history, { role: "user", content: message }, { role: "assistant", content: reply }];
+    if (updatedHistory.length > 20) updatedHistory.splice(0, 2);
+    memoryStore.set(userId, updatedHistory);
 
-    // 4. Response
+    // 7. Send Response to User
     res.json({ 
       reply, 
-      sources: useWeb ? [webContext] : [],
-      meta: { model_used: tier } 
+      sources: useWeb && webContext ? [webContext] : [],
+      meta: { tier_used: tier }
     });
 
   } catch (err) {
+    console.error("Endpoint Error:", err.message);
     res.status(500).json({ error: "Intelligence failure", details: err.message });
   }
 });
@@ -122,14 +135,15 @@ app.post("/api/chat", rateLimit({ windowMs: 60000, max: 25 }), async (req, res) 
 // =======================
 // ⏰ AUTO-WAKEUP (LLAMA 4 SCOUT)
 // =======================
+// Runs every 10 minutes. Terminal output only. 1-word limit.
 setInterval(async () => {
-  console.log("--- Executing LLaMA 4 Scout Wakeup ---");
+  console.log("--- Executing LLaMA 4 Scout Heartbeat ---");
   try {
     const groq = new Groq({ apiKey: process.env.GROQ_API_KEY1 });
     const completion = await groq.chat.completions.create({
       model: WAKEUP_MODEL,
       messages: [{ role: "user", content: "Rebooting Server Dont say a sentence Just Say 1 Word" }],
-      max_tokens: 10,
+      max_tokens: 5,
     });
     console.log(`[LLaMA 4 RESPONSE]: ${completion.choices[0]?.message?.content?.trim()}`);
   } catch (err) {
@@ -138,9 +152,10 @@ setInterval(async () => {
 }, 10 * 60 * 1000);
 
 // =======================
-// 🚀 SERVER
+// 🚀 SERVER START
 // =======================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`PMCAI Ready. Tiering: ${PRIMARY_MODEL} -> ${SECONDARY_MODEL}`);
+  console.log(`🚀 PMCAI Backend Live on Port ${PORT}`);
+  console.log(`Primary: ${PRIMARY_MODEL} | Fallback: ${SECONDARY_MODEL}`);
 });
