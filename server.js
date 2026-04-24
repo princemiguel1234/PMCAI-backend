@@ -16,10 +16,11 @@ const IDENTITY = {
   creatorInfo: "PMC is a normal dude",
 };
 
-const GROQ_MODEL = "qwen/qwen3-32b";
+// ✅ UPDATED MODEL
+const GROQ_MODEL = "llama-3.3-70b-versatile";
 
 // =======================
-// MEMORY (25 Q&A LIMIT)
+// 🧠 MEMORY (25 LIMIT)
 // =======================
 const memoryStore = new Map();
 
@@ -34,14 +35,12 @@ function addMemory(id, user, assistant) {
 
   mem.push({ user, assistant });
 
-  // keep last 25 only
-  if (mem.length > 25) {
-    mem.splice(0, mem.length - 25);
-  }
+  // ✅ safer trim (avoids negative splice bugs)
+  while (mem.length > 25) mem.shift();
 }
 
 // =======================
-// MIDDLEWARE
+// ⚙️ MIDDLEWARE
 // =======================
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
@@ -50,12 +49,14 @@ app.use(
   "/api/chat",
   rateLimit({
     windowMs: 60 * 1000,
-    max: 20,
+    max: 25, // slightly increased
+    standardHeaders: true,
+    legacyHeaders: false,
   })
 );
 
 // =======================
-// GROQ CLIENTS (FALLBACK)
+// 🔑 GROQ CLIENTS (SMART FALLBACK)
 // =======================
 function getGroqClients() {
   const keys = [
@@ -69,7 +70,7 @@ function getGroqClients() {
 
 function shouldRetryGroqError(err) {
   const status = err?.status || err?.response?.status;
-  return !status || [401, 403, 408, 429, 500, 502, 503, 504].includes(status);
+  return !status || [408, 429, 500, 502, 503, 504].includes(status);
 }
 
 async function groqChatWithFallback(params) {
@@ -80,7 +81,8 @@ async function groqChatWithFallback(params) {
 
   for (const client of clients) {
     try {
-      return await client.chat.completions.create(params);
+      const res = await client.chat.completions.create(params);
+      if (res?.choices?.length) return res;
     } catch (err) {
       lastError = err;
       if (!shouldRetryGroqError(err)) throw err;
@@ -91,7 +93,7 @@ async function groqChatWithFallback(params) {
 }
 
 // =======================
-// WEB SEARCH
+// 🌐 WEB SEARCH
 // =======================
 async function searchWeb(query) {
   try {
@@ -103,17 +105,19 @@ async function searchWeb(query) {
       },
       body: JSON.stringify({
         query,
-        max_results: 7,
+        max_results: 5,
         include_answer: true,
       }),
     });
+
+    if (!res.ok) return [];
 
     const data = await res.json();
 
     return (data.results || []).map((r) => ({
       title: r.title || "No title",
       url: r.url || "No URL",
-      snippet: (r.content || "").slice(0, 200),
+      snippet: (r.content || "").slice(0, 180),
     }));
   } catch {
     return [];
@@ -121,27 +125,27 @@ async function searchWeb(query) {
 }
 
 // =======================
-// CHAT DETECTOR
+// 💬 CHAT DETECTOR
 // =======================
 function isChatOnlyMessage(msg = "") {
-  return /^(hello|hi|hey|lol|what is your name|who are you|creator|who made you|owner)$/i.test(
-    msg.trim().toLowerCase()
+  return /^(hello|hi|hey|lol|what is your name|who are you|creator|owner|who made you)$/i.test(
+    msg.trim()
   );
 }
 
 // =======================
-// ROOT
+// 🏠 ROOT
 // =======================
 app.get("/", (req, res) => {
   res.send("PMCAI RUNNING 🚀");
 });
 
 // =======================
-// CHAT ENDPOINT
+// 💬 CHAT ENDPOINT
 // =======================
 app.post("/api/chat", async (req, res) => {
   try {
-    const userMessage = req.body.message;
+    const userMessage = req.body.message?.trim();
     const userId = req.ip;
 
     if (!userMessage) {
@@ -152,14 +156,14 @@ app.post("/api/chat", async (req, res) => {
     const chatOnly = isChatOnlyMessage(userMessage);
 
     // =======================
-    // FORMAT MEMORY
+    // 🧠 MEMORY FORMAT
     // =======================
     const memory = getMemory(userId)
       .map((m, i) => `Q${i + 1}: ${m.user}\nA${i + 1}: ${m.assistant}`)
       .join("\n");
 
     // =======================
-    // SIMPLE CHAT MODE
+    // ⚡ SIMPLE CHAT MODE
     // =======================
     if (chatOnly) {
       let reply = "Hi! I'm PMCAI.";
@@ -176,7 +180,7 @@ app.post("/api/chat", async (req, res) => {
     }
 
     // =======================
-    // WEB SEARCH
+    // 🌐 WEB SEARCH
     // =======================
     let webResults = [];
 
@@ -194,46 +198,29 @@ app.post("/api/chat", async (req, res) => {
       : "No web sources provided.";
 
     // =======================
-    // SYSTEM PROMPT (CLEAN + CONTROLLED THINK)
+    // 🧠 SYSTEM PROMPT (CLEAN)
     // =======================
     const systemPrompt = `
-You are PMCAI ( PRINCE MIGUEL CAYETANO AI ),
-Your Creator Is PMC ( PRINCE MIGUEL CAYETANO ).
-PMC is a Normal Male Person
-
-When you use reasoning, you must wrap it inside <think> tags.
-
-When reasoning is needed, include a <think> section.
-
-Format:
-<think>
-1–3 very short sentences (brief reasoning only)
-</think>
+You are PMCAI created by ${IDENTITY.creator}.
 
 Rules:
-- Use the <think> tag ONLY for internal reasoning
-- Keep it concise (no long explanations)
-- Do not include anything unrelated inside <think>
-
-RULES:
-- Keep <think> short and clean
-- Do NOT output long reasoning
-- Use web sources if provided
-- Be accurate, direct, and helpful
+- Do not over-explain
+- Be accurate and direct
+- Use sources if provided
 `;
 
     const userPrompt = `
 User: ${userMessage}
 
 Memory:
-${memory}
+${memory || "None"}
 
-Web sources:
+Web Sources:
 ${sourcesText}
 `;
 
     // =======================
-    // GROQ CALL
+    // 🤖 GROQ CALL
     // =======================
     const completion = await groqChatWithFallback({
       model: GROQ_MODEL,
@@ -241,8 +228,8 @@ ${sourcesText}
         { role: "system", content: systemPrompt },
         { role: "user", content: userPrompt },
       ],
-      temperature: 0.3,
-      max_completion_tokens: 900,
+      temperature: 0.4,
+      max_tokens: 800, // ✅ FIXED PARAM
       top_p: 1,
     });
 
@@ -251,14 +238,14 @@ ${sourcesText}
       "I couldn't generate a response.";
 
     // =======================
-    // SAFETY NET
+    // 🛡️ THINK SAFETY NET
     // =======================
     if (!reply.includes("<think>")) {
       reply = `<think>\nprocessed\n</think>\n\n${reply}`;
     }
 
     // =======================
-    // SAVE MEMORY
+    // 💾 SAVE MEMORY
     // =======================
     addMemory(userId, userMessage, reply);
 
@@ -268,7 +255,7 @@ ${sourcesText}
       verified: webResults.length > 0,
     });
   } catch (err) {
-    console.error(err);
+    console.error("CHAT ERROR:", err);
 
     res.status(500).json({
       error: "Server error",
@@ -278,7 +265,7 @@ ${sourcesText}
 });
 
 // =======================
-// SELF PING
+// 🔁 SELF PING (ANTI-SLEEP)
 // =======================
 setInterval(async () => {
   try {
@@ -287,7 +274,7 @@ setInterval(async () => {
 }, 60000);
 
 // =======================
-// START SERVER
+// 🚀 START SERVER
 // =======================
 const PORT = process.env.PORT || 3000;
 
