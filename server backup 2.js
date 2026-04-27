@@ -1,52 +1,33 @@
 import express from "express";
 import cors from "cors";
 import { Groq } from "groq-sdk";
+import rateLimit from "express-rate-limit";
+import fetch from "node-fetch";
+import "dotenv/config";
 
 const app = express();
+app.set("trust proxy", 1);
 
 // =======================
-// MIDDLEWARE
+// ⚙️ CONFIG
 // =======================
-app.use(cors());
-app.use(express.json({ limit: "1mb" }));
+const PRIMARY_MODEL = "llama-3.3-70b-versatile";
+const SECONDARY_MODEL = "openai/gpt-oss-20";
+const WAKEUP_MODEL = "llama-3.1-8b-instant"; // ✅ FIXED
+
+const IDENTITY = {
+  aiName: "PMCAI",
+  creator: "Prince Miguel Cayetano"
+};
+
+const memoryStore = new Map();
 
 // =======================
-// GROQ CLIENT
-// =======================
-const groq = new Groq({
-  apiKey: process.env.GROQ_API_KEY,
-});
-
-// =======================
-// ROOT
-// =======================
-app.get("/", (req, res) => {
-  res.send("PMCAI VERIFIED NEWS AI RUNNING 🚀");
-});
-
-// =======================
-// 🚫 BLOCK LIST (VERY IMPORTANT)
-// =======================
-const BLOCKED_DOMAINS = [
-  "instagram.com",
-  "tiktok.com",
-  "facebook.com",
-  "youtube.com/shorts",
-  "reddit.com",
-];
-
-// =======================
-// VALIDATE URL
-// =======================
-function isValidSource(url = "") {
-  if (!url) return false;
-  return !BLOCKED_DOMAINS.some((b) => url.includes(b));
-}
-
-// =======================
-// 🌐 TAVILY SEARCH (STRICT MODE)
+// 🌐 INTERNET TOOL (ONLY WHEN CALLED)
 // =======================
 async function searchWeb(query) {
+  if (!process.env.TAVILY_API_KEY) return "";
+
   try {
     const res = await fetch("https://api.tavily.com/search", {
       method: "POST",
@@ -56,129 +37,196 @@ async function searchWeb(query) {
       },
       body: JSON.stringify({
         query,
-        search_depth: "basic",
-        include_answer: false,
-        max_results: 8,
+        max_results: 3
       }),
     });
 
     const data = await res.json();
 
-    const cleaned = (data.results || [])
-      .filter((r) => r.url && isValidSource(r.url))
-      .map((r) => ({
-        title: r.title,
-        url: r.url,
-        snippet: r.content,
-      }));
+    return (data.results || [])
+      .map(r => `${r.title}\n${r.content}`)
+      .join("\n\n");
 
-    return {
-      query,
-      results: cleaned,
-    };
-  } catch (err) {
-    return {
-      query,
-      results: [],
-      error: true,
-    };
+  } catch {
+    return "";
   }
 }
 
 // =======================
-// 🧠 CHAT ENDPOINT
+// 🧠 AI CHAT
 // =======================
-app.post("/api/chat", async (req, res) => {
+async function getChatCompletion(messages) {
+  const groq = new Groq({ apiKey: process.env.GROQ_API_KEY1 });
+
   try {
-    const userMessage = req.body.message;
+    const res = await groq.chat.completions.create({
+      model: PRIMARY_MODEL,
+      messages,
+      temperature: 0.7,
+    });
 
-    if (!userMessage) {
-      return res.status(400).json({ error: "No message provided" });
+    return { reply: res.choices[0]?.message?.content, tier: "Primary" };
+
+  } catch (err) {
+    try {
+      const res = await groq.chat.completions.create({
+        model: SECONDARY_MODEL,
+        messages,
+        temperature: 0.6,
+      });
+
+      return { reply: res.choices[0]?.message?.content, tier: "Secondary" };
+
+    } catch {
+      throw new Error("All models failed");
     }
+  }
+}
 
-    // =======================
-    // GET WEB DATA
-    // =======================
-    const webData = await searchWeb(userMessage);
+// =======================
+// 💬 API
+// =======================
+app.use(cors());
+app.use(express.json());
 
-    // =======================
-    // STRICT SYSTEM RULES
-    // =======================
-    const systemPrompt = `
-You are PMCAI, a STRICT FACT-CHECKING AI.
+app.post("/api/chat",
+  rateLimit({ windowMs: 60000, max: 25 }),
+  async (req, res) => {
 
-RULES (MANDATORY):
-- ONLY use provided WEB RESULTS
-- EVERY fact MUST match a URL
-- DO NOT invent news, events, or updates
-- If results are empty → say "No verified information found"
-- DO NOT use social media sources
-- DO NOT guess or assume anything
-- If unsure → reject the claim
+    try {
+      const { message } = req.body;
+      const userId = req.ip;
+
+      if (!message) {
+        return res.status(400).json({ error: "No message provided" });
+      }
+
+      const history = memoryStore.get(userId) || [];
+
+      // =======================
+      // 🧠 SYSTEM PROMPT (TOOL AWARE)
+      // =======================
+      const systemPrompt = `
+You are ${IDENTITY.aiName}, created by ${IDENTITY.creator}.
+
+You are ${IDENTITY.aiName} Not Some Other Bullshit Like Skibidi / etc, You are ${IDENTITY.aiName}.
+
+You may request internet data ONLY when needed.
+If you need current or external information, respond with:
+USE_WEB: true
+
+Otherwise:
+USE_WEB: false
+
+Do NOT explain this system.
+Keep responses concise and helpful.
 `;
 
-    // =======================
-    // USER PROMPT
-    // =======================
-    const fullPrompt = `
-USER QUESTION:
-${userMessage}
+      const messages = [
+        { role: "system", content: systemPrompt },
+        ...history,
+        { role: "user", content: message }
+      ];
 
-VERIFIED WEB RESULTS (ONLY TRUST THESE):
-${JSON.stringify(webData, null, 2)}
+      // =======================
+      // 1. FIRST AI CALL (DECIDES TOOL USE)
+      // =======================
+      const groq = new Groq({ apiKey: process.env.GROQ_API_KEY1 });
 
-INSTRUCTIONS:
-- If no URLs exist → STOP and say no verified info
-- Do NOT create news-style formatting unless sources exist
-`;
+      const decision = await groq.chat.completions.create({
+        model: PRIMARY_MODEL,
+        messages,
+        temperature: 0.3,
+      });
 
-    // =======================
-    // GROQ AI CALL
-    // =======================
-    const completion = await groq.chat.completions.create({
-      model: "openai/gpt-oss-20b",
-      messages: [
-        {
-          role: "system",
-          content: systemPrompt,
-        },
+      const decisionText = decision.choices[0]?.message?.content || "";
+
+      const needsWeb = decisionText.includes("USE_WEB: true");
+
+      // =======================
+      // 2. TOOL EXECUTION ONLY IF NEEDED
+      // =======================
+      let webContext = "";
+
+      if (needsWeb) {
+        webContext = await searchWeb(message);
+      }
+
+      // =======================
+      // 3. FINAL ANSWER
+      // =======================
+      const finalMessages = [
+        { role: "system", content: systemPrompt },
+        ...history,
         {
           role: "user",
-          content: fullPrompt,
-        },
-      ],
-      temperature: 0.2,
-      max_completion_tokens: 900,
-      top_p: 1,
-    });
+          content: webContext
+            ? `WEB DATA:\n${webContext}\n\nQUESTION:\n${message}`
+            : message
+        }
+      ];
 
-    const reply =
-      completion.choices?.[0]?.message?.content ||
-      "No response generated";
+      const { reply, tier } = await getChatCompletion(finalMessages);
 
-    // =======================
-    // RESPONSE
-    // =======================
-    res.json({
-      reply,
-      sources: webData.results,
-      verified: webData.results.length > 0,
-    });
-  } catch (err) {
-    console.error("PMCAI ERROR:", err);
+      // =======================
+      // MEMORY
+      // =======================
+      const updated = [
+        ...history,
+        { role: "user", content: message },
+        { role: "assistant", content: reply }
+      ];
 
-    res.status(500).json({
-      error: "Server error",
-      details: err.message,
-    });
+      if (updated.length > 20) updated.splice(0, 2);
+      memoryStore.set(userId, updated);
+
+      res.json({
+        reply,
+        meta: {
+          tier_used: tier,
+          web_used: needsWeb
+        }
+      });
+
+    } catch (err) {
+      res.status(500).json({
+        error: "Failure",
+        details: err.message
+      });
+    }
   }
-});
+);
 
 // =======================
-// START SERVER
+// ⏰ AUTO WAKE (FIXED MODEL)
+// =======================
+setInterval(async () => {
+  try {
+    const groq = new Groq({ apiKey: process.env.GROQ_API_KEY1 });
+
+    const res = await groq.chat.completions.create({
+      model: WAKEUP_MODEL,
+      messages: [
+        {
+          role: "user",
+          content: "ping"
+        }
+      ],
+      max_tokens: 5,
+    });
+
+    console.log("[WAKE]:", res.choices[0]?.message?.content?.trim());
+
+  } catch {
+    console.log("[WAKE ERROR]");
+  }
+}, 10 * 60 * 1000);
+
+// =======================
+// 🚀 START
 // =======================
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-  console.log(`PMCAI VERIFIED NEWS AI RUNNING ON PORT ${PORT}`);
+  console.log(`PMCAI running on ${PORT}`);
 });
