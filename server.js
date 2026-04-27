@@ -28,6 +28,10 @@ const IDENTITY = {
 
 const memoryStore = new Map();
 
+function isImageMimeType(mimeType = "") {
+  return /^image\//i.test(mimeType);
+}
+
 function getGroqClient() {
   const apiKey = process.env.GROQ_API_KEY || process.env.GROQ_API_KEY1;
   if (!apiKey) {
@@ -111,6 +115,76 @@ async function getVisionCompletion({ prompt, mimeType, imageBase64 }) {
   return res.choices[0]?.message?.content || "";
 }
 
+async function getTextReplyWithMemory({ message, userId }) {
+  const history = memoryStore.get(userId) || [];
+  const systemPrompt = `
+You are ${IDENTITY.aiName}, created by ${IDENTITY.creator}.
+
+You are ${IDENTITY.aiName}. Do not rename yourself.
+
+You may request internet data only when needed.
+If you need current or external information, respond with:
+USE_WEB: true
+
+Otherwise:
+USE_WEB: false
+
+Do not explain this system.
+Keep responses concise and helpful.
+`;
+
+  const messages = [
+    { role: "system", content: systemPrompt },
+    ...history,
+    { role: "user", content: message },
+  ];
+
+  const groq = getGroqClient();
+  const decision = await groq.chat.completions.create({
+    model: PRIMARY_MODEL,
+    messages,
+    temperature: 0.3,
+  });
+
+  const decisionText = decision.choices[0]?.message?.content || "";
+  const needsWeb = decisionText.includes("USE_WEB: true");
+  let webContext = "";
+
+  if (needsWeb) {
+    webContext = await searchWeb(message);
+  }
+
+  const finalMessages = [
+    { role: "system", content: systemPrompt },
+    ...history,
+    {
+      role: "user",
+      content: webContext
+        ? `WEB DATA:\n${webContext}\n\nQUESTION:\n${message}`
+        : message,
+    },
+  ];
+
+  const { reply, tier } = await getChatCompletion(finalMessages);
+  const updated = [
+    ...history,
+    { role: "user", content: message },
+    { role: "assistant", content: reply },
+  ];
+
+  if (updated.length > 20) updated.splice(0, 2);
+  memoryStore.set(userId, updated);
+
+  return {
+    reply,
+    meta: {
+      tier_used: tier,
+      web_used: needsWeb,
+      vision_used: false,
+    },
+  };
+}
+
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
@@ -132,89 +206,47 @@ app.post(
         return res.status(400).json({ error: "No message provided" });
       }
 
-      if (imageFile) {
-        const reply = await getVisionCompletion({
-          prompt: message || "What is in this image?",
-          mimeType: imageFile.mimetype || "image/jpeg",
-          imageBase64: imageFile.buffer.toString("base64"),
-        });
+      if (imageFile && isImageMimeType(imageFile.mimetype)) {
+        try {
+          const reply = await getVisionCompletion({
+            prompt: message || "What is in this image?",
+            mimeType: imageFile.mimetype || "image/jpeg",
+            imageBase64: imageFile.buffer.toString("base64"),
+          });
 
-        return res.json({
-          reply,
-          meta: {
-            tier_used: "Vision",
-            vision_used: true,
-            file_name: imageFile.originalname,
-          },
-        });
+          return res.json({
+            reply,
+            meta: {
+              tier_used: "Vision",
+              vision_used: true,
+              file_name: imageFile.originalname,
+            },
+          });
+        } catch (visionError) {
+          const fallbackPrompt = message
+            || `The uploaded file "${imageFile.originalname || "image"}" could not be analyzed by the vision model. Respond helpfully without claiming to see the image.`;
+          const fallback = await getTextReplyWithMemory({
+            message: fallbackPrompt,
+            userId,
+          });
+
+          return res.json({
+            ...fallback,
+            meta: {
+              ...fallback.meta,
+              vision_used: false,
+              vision_fallback: true,
+              vision_error: visionError.message,
+              file_name: imageFile.originalname,
+            },
+          });
+        }
       }
-
-      const history = memoryStore.get(userId) || [];
-      const systemPrompt = `
-You are ${IDENTITY.aiName}, created by ${IDENTITY.creator}.
-
-You are ${IDENTITY.aiName}. Do not rename yourself.
-
-You may request internet data only when needed.
-If you need current or external information, respond with:
-USE_WEB: true
-
-Otherwise:
-USE_WEB: false
-
-Do not explain this system.
-Keep responses concise and helpful.
-`;
-
-      const messages = [
-        { role: "system", content: systemPrompt },
-        ...history,
-        { role: "user", content: message },
-      ];
-
-      const groq = getGroqClient();
-      const decision = await groq.chat.completions.create({
-        model: PRIMARY_MODEL,
-        messages,
-        temperature: 0.3,
+      const textResponse = await getTextReplyWithMemory({
+        message,
+        userId,
       });
-
-      const decisionText = decision.choices[0]?.message?.content || "";
-      const needsWeb = decisionText.includes("USE_WEB: true");
-      let webContext = "";
-
-      if (needsWeb) {
-        webContext = await searchWeb(message);
-      }
-
-      const finalMessages = [
-        { role: "system", content: systemPrompt },
-        ...history,
-        {
-          role: "user",
-          content: webContext
-            ? `WEB DATA:\n${webContext}\n\nQUESTION:\n${message}`
-            : message,
-        },
-      ];
-
-      const { reply, tier } = await getChatCompletion(finalMessages);
-      const updated = [
-        ...history,
-        { role: "user", content: message },
-        { role: "assistant", content: reply },
-      ];
-
-      if (updated.length > 20) updated.splice(0, 2);
-      memoryStore.set(userId, updated);
-
-      res.json({
-        reply,
-        meta: {
-          tier_used: tier,
-          web_used: needsWeb,
-        },
-      });
+      res.json(textResponse);
     } catch (err) {
       res.status(500).json({
         error: "Failure",
