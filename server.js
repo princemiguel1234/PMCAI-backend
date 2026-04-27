@@ -17,7 +17,7 @@ const upload = multer({
 });
 
 const PRIMARY_MODEL = "llama-3.3-70b-versatile";
-const SECONDARY_MODEL = "openai/gpt-oss-20";
+const SECONDARY_MODEL = "openai/gpt-oss-20b";
 const VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct";
 const WAKEUP_MODEL = "llama-3.1-8b-instant";
 
