@@ -127,9 +127,8 @@ function buildSystemPrompt(userSystemPrompt = "") {
 }
 
 function logChatTranscript({ ip, conversationId, userMessage, aiMessage }) {
-  const label = conversationId ? `${ip}:${conversationId}` : ip;
-  console.log(`( USER ${label} ) : ${userMessage || "[no text]"}`);
-  console.log(`( PMCAI Response ) : ${aiMessage || "[empty response]"}`);
+  console.log(`( USER ${ip} ) : ${userMessage || "[no text]"}`);
+  console.log(`( AI Responce ) : ${aiMessage || "[empty response]"}`);
 }
 
 function getGroqApiEntries() {
