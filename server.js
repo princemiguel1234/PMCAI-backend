@@ -261,7 +261,16 @@ setInterval(async () => {
     const groq = getGroqClient();
     const res = await groq.chat.completions.create({
       model: WAKEUP_MODEL,
-      messages: [{ role: "user", content: "ping" }],
+      messages: [
+  {
+    role: "system",
+    content: "Reply with 'ok' only.",
+  },
+  {
+    role: "user",
+    content: ".",
+  },
+],
       max_tokens: 5,
     });
 
@@ -269,7 +278,7 @@ setInterval(async () => {
   } catch {
     console.log("[WAKE ERROR]");
   }
-}, 10 * 60 * 1000);
+}, 14 * 60 * 1000);
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
