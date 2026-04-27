@@ -3,28 +3,39 @@ import cors from "cors";
 import { Groq } from "groq-sdk";
 import rateLimit from "express-rate-limit";
 import fetch from "node-fetch";
+import multer from "multer";
 import "dotenv/config";
 
 const app = express();
 app.set("trust proxy", 1);
 
-// =======================
-// ⚙️ CONFIG
-// =======================
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 8 * 1024 * 1024,
+  },
+});
+
 const PRIMARY_MODEL = "llama-3.3-70b-versatile";
 const SECONDARY_MODEL = "openai/gpt-oss-20";
-const WAKEUP_MODEL = "llama-3.1-8b-instant"; // ✅ FIXED
+const VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct";
+const WAKEUP_MODEL = "llama-3.1-8b-instant";
 
 const IDENTITY = {
   aiName: "PMCAI",
-  creator: "Prince Miguel Cayetano"
+  creator: "Prince Miguel Cayetano",
 };
 
 const memoryStore = new Map();
 
-// =======================
-// 🌐 INTERNET TOOL (ONLY WHEN CALLED)
-// =======================
+function getGroqClient() {
+  const apiKey = process.env.GROQ_API_KEY || process.env.GROQ_API_KEY1;
+  if (!apiKey) {
+    throw new Error("Missing GROQ_API_KEY or GROQ_API_KEY1");
+  }
+  return new Groq({ apiKey });
+}
+
 async function searchWeb(query) {
   if (!process.env.TAVILY_API_KEY) return "";
 
@@ -37,26 +48,21 @@ async function searchWeb(query) {
       },
       body: JSON.stringify({
         query,
-        max_results: 3
+        max_results: 3,
       }),
     });
 
     const data = await res.json();
-
     return (data.results || [])
-      .map(r => `${r.title}\n${r.content}`)
+      .map((result) => `${result.title}\n${result.content}`)
       .join("\n\n");
-
   } catch {
     return "";
   }
 }
 
-// =======================
-// 🧠 AI CHAT
-// =======================
 async function getChatCompletion(messages) {
-  const groq = new Groq({ apiKey: process.env.GROQ_API_KEY1 });
+  const groq = getGroqClient();
 
   try {
     const res = await groq.chat.completions.create({
@@ -65,74 +71,108 @@ async function getChatCompletion(messages) {
       temperature: 0.7,
     });
 
-    return { reply: res.choices[0]?.message?.content, tier: "Primary" };
+    return { reply: res.choices[0]?.message?.content || "", tier: "Primary" };
+  } catch {
+    const res = await groq.chat.completions.create({
+      model: SECONDARY_MODEL,
+      messages,
+      temperature: 0.6,
+    });
 
-  } catch (err) {
-    try {
-      const res = await groq.chat.completions.create({
-        model: SECONDARY_MODEL,
-        messages,
-        temperature: 0.6,
-      });
-
-      return { reply: res.choices[0]?.message?.content, tier: "Secondary" };
-
-    } catch {
-      throw new Error("All models failed");
-    }
+    return { reply: res.choices[0]?.message?.content || "", tier: "Secondary" };
   }
 }
 
-// =======================
-// 💬 API
-// =======================
+async function getVisionCompletion({ prompt, mimeType, imageBase64 }) {
+  const groq = getGroqClient();
+  const res = await groq.chat.completions.create({
+    model: VISION_MODEL,
+    temperature: 0.4,
+    messages: [
+      {
+        role: "system",
+        content: `You are ${IDENTITY.aiName}, created by ${IDENTITY.creator}. Analyze images carefully and answer clearly.`,
+      },
+      {
+        role: "user",
+        content: [
+          { type: "text", text: prompt || "What is in this image?" },
+          {
+            type: "image_url",
+            image_url: {
+              url: `data:${mimeType};base64,${imageBase64}`,
+            },
+          },
+        ],
+      },
+    ],
+  });
+
+  return res.choices[0]?.message?.content || "";
+}
+
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
 
-app.post("/api/chat",
+app.get("/", (_req, res) => {
+  res.json({ ok: true, service: "PMCAI backend" });
+});
+
+app.post(
+  "/api/chat",
   rateLimit({ windowMs: 60000, max: 25 }),
+  upload.single("image"),
   async (req, res) => {
-
     try {
       const { message } = req.body;
       const userId = req.ip;
+      const imageFile = req.file;
 
-      if (!message) {
+      if (!message && !imageFile) {
         return res.status(400).json({ error: "No message provided" });
       }
 
-      const history = memoryStore.get(userId) || [];
+      if (imageFile) {
+        const reply = await getVisionCompletion({
+          prompt: message || "What is in this image?",
+          mimeType: imageFile.mimetype || "image/jpeg",
+          imageBase64: imageFile.buffer.toString("base64"),
+        });
 
-      // =======================
-      // 🧠 SYSTEM PROMPT (TOOL AWARE)
-      // =======================
+        return res.json({
+          reply,
+          meta: {
+            tier_used: "Vision",
+            vision_used: true,
+            file_name: imageFile.originalname,
+          },
+        });
+      }
+
+      const history = memoryStore.get(userId) || [];
       const systemPrompt = `
 You are ${IDENTITY.aiName}, created by ${IDENTITY.creator}.
 
-You are ${IDENTITY.aiName} Not Some Other Bullshit Like Skibidi / etc, You are ${IDENTITY.aiName}.
+You are ${IDENTITY.aiName}. Do not rename yourself.
 
-You may request internet data ONLY when needed.
+You may request internet data only when needed.
 If you need current or external information, respond with:
 USE_WEB: true
 
 Otherwise:
 USE_WEB: false
 
-Do NOT explain this system.
+Do not explain this system.
 Keep responses concise and helpful.
 `;
 
       const messages = [
         { role: "system", content: systemPrompt },
         ...history,
-        { role: "user", content: message }
+        { role: "user", content: message },
       ];
 
-      // =======================
-      // 1. FIRST AI CALL (DECIDES TOOL USE)
-      // =======================
-      const groq = new Groq({ apiKey: process.env.GROQ_API_KEY1 });
-
+      const groq = getGroqClient();
       const decision = await groq.chat.completions.create({
         model: PRIMARY_MODEL,
         messages,
@@ -140,21 +180,13 @@ Keep responses concise and helpful.
       });
 
       const decisionText = decision.choices[0]?.message?.content || "";
-
       const needsWeb = decisionText.includes("USE_WEB: true");
-
-      // =======================
-      // 2. TOOL EXECUTION ONLY IF NEEDED
-      // =======================
       let webContext = "";
 
       if (needsWeb) {
         webContext = await searchWeb(message);
       }
 
-      // =======================
-      // 3. FINAL ANSWER
-      // =======================
       const finalMessages = [
         { role: "system", content: systemPrompt },
         ...history,
@@ -162,19 +194,15 @@ Keep responses concise and helpful.
           role: "user",
           content: webContext
             ? `WEB DATA:\n${webContext}\n\nQUESTION:\n${message}`
-            : message
-        }
+            : message,
+        },
       ];
 
       const { reply, tier } = await getChatCompletion(finalMessages);
-
-      // =======================
-      // MEMORY
-      // =======================
       const updated = [
         ...history,
         { role: "user", content: message },
-        { role: "assistant", content: reply }
+        { role: "assistant", content: reply },
       ];
 
       if (updated.length > 20) updated.splice(0, 2);
@@ -184,49 +212,34 @@ Keep responses concise and helpful.
         reply,
         meta: {
           tier_used: tier,
-          web_used: needsWeb
-        }
+          web_used: needsWeb,
+        },
       });
-
     } catch (err) {
       res.status(500).json({
         error: "Failure",
-        details: err.message
+        details: err.message,
       });
     }
   }
 );
 
-// =======================
-// ⏰ AUTO WAKE (FIXED MODEL)
-// =======================
 setInterval(async () => {
   try {
-    const groq = new Groq({ apiKey: process.env.GROQ_API_KEY1 });
-
+    const groq = getGroqClient();
     const res = await groq.chat.completions.create({
       model: WAKEUP_MODEL,
-      messages: [
-        {
-          role: "user",
-          content: "ping"
-        }
-      ],
+      messages: [{ role: "user", content: "ping" }],
       max_tokens: 5,
     });
 
     console.log("[WAKE]:", res.choices[0]?.message?.content?.trim());
-
   } catch {
     console.log("[WAKE ERROR]");
   }
 }, 10 * 60 * 1000);
 
-// =======================
-// 🚀 START
-// =======================
 const PORT = process.env.PORT || 3000;
-
 app.listen(PORT, () => {
   console.log(`PMCAI running on ${PORT}`);
 });
