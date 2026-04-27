@@ -32,6 +32,11 @@ function isImageMimeType(mimeType = "") {
   return /^image\//i.test(mimeType);
 }
 
+function logChatTranscript({ ip, userMessage, aiMessage }) {
+  console.log(`(${ip}) : The user said ${userMessage || "[no text]"}`);
+  console.log(`(AI Response) : The AI said ${aiMessage || "[empty response]"}`);
+}
+
 function getGroqApiEntries() {
   return [
     { label: "key1", value: process.env.GROQ_API_KEY1 },
@@ -278,6 +283,11 @@ app.post(
             mimeType: imageFile.mimetype || "image/jpeg",
             imageBase64: imageFile.buffer.toString("base64"),
           });
+          logChatTranscript({
+            ip: userId,
+            userMessage: message || `[image] ${imageFile.originalname || "upload"}`,
+            aiMessage: reply,
+          });
 
           return res.json({
             reply,
@@ -293,6 +303,11 @@ app.post(
           const fallback = await getTextReplyWithMemory({
             message: fallbackPrompt,
             userId,
+          });
+          logChatTranscript({
+            ip: userId,
+            userMessage: message || `[image fallback] ${imageFile.originalname || "upload"}`,
+            aiMessage: fallback.reply,
           });
 
           return res.json({
@@ -310,6 +325,11 @@ app.post(
       const textResponse = await getTextReplyWithMemory({
         message,
         userId,
+      });
+      logChatTranscript({
+        ip: userId,
+        userMessage: message,
+        aiMessage: textResponse.reply,
       });
       res.json(textResponse);
     } catch (err) {
