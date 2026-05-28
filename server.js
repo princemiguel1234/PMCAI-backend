@@ -10,9 +10,27 @@ const app = express();
 app.set("trust proxy", 1);
 
 const PRIMARY_MODEL = "llama-3.3-70b-versatile";
-const SECONDARY_MODEL = "openai/gpt-oss-120";
+const SECONDARY_MODEL = "openai/gpt-oss-120b";
 const VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct";
 const WHISPER_MODEL = "whisper-large-v3-turbo";
+const MODEL_OPTIONS = {
+  "PMCAI 0": {
+    text: "openai/gpt-oss-20b",
+    vision: VISION_MODEL,
+    temperature: 0.6,
+  },
+  "PMCAI 1": {
+    text: PRIMARY_MODEL,
+    vision: VISION_MODEL,
+    temperature: 0.7,
+  },
+  "PMCAI 2": {
+    text: SECONDARY_MODEL,
+    vision: VISION_MODEL,
+    temperature: 0.6,
+  },
+};
+const DEFAULT_MODEL_LABEL = "PMCAI 1";
 
 const MAX_HISTORY_MESSAGES = 14;
 const MAX_MEMORY_MESSAGES = 20;
@@ -117,6 +135,15 @@ function normalizeText(value, maxLength = 20000) {
         .trim()
         .slice(0, maxLength)
     : "";
+}
+
+function normalizeModelLabel(value = "") {
+  return Object.prototype.hasOwnProperty.call(MODEL_OPTIONS, value) ? value : DEFAULT_MODEL_LABEL;
+}
+
+function getModelOption(value = "") {
+  const label = normalizeModelLabel(value);
+  return { label, ...MODEL_OPTIONS[label] };
 }
 
 function safeJsonParse(value, fallback = null) {
@@ -415,42 +442,28 @@ async function searchWeb(query) {
   }
 }
 
-async function getChatCompletion(messages) {
-  const attempts = [
-    { model: PRIMARY_MODEL, tier: "Primary", temperature: 0.7 },
-    { model: SECONDARY_MODEL, tier: "Secondary", temperature: 0.6 },
-    { model: VISION_MODEL, tier: "Vision Fallback", temperature: 0.6 },
-  ];
-  let lastError = null;
-
-  for (const attempt of attempts) {
-    try {
-      const res = await runGroqWithFallback(
-        (groq) => groq.chat.completions.create({
-          model: attempt.model,
-          messages,
-          temperature: attempt.temperature,
-        }),
-        { label: `chat ${attempt.tier}` }
-      );
-      const reply = normalizeText(res.choices[0]?.message?.content || "", MAX_JSON_TEXT_LENGTH);
-      if (!reply) {
-        throw new Error(`${attempt.tier} returned an empty reply`);
-      }
-      return { reply, tier: attempt.tier };
-    } catch (error) {
-      lastError = error;
-      console.log(`[GROQ] ${attempt.tier} exhausted: ${error.message}`);
-    }
-  }
-
-  throw lastError || new Error("All chat models failed");
-}
-
-async function getVisionCompletion({ prompt, mimeType, imageBase64, systemPrompt = "" }) {
+async function getChatCompletion(messages, modelLabel = DEFAULT_MODEL_LABEL) {
+  const selected = getModelOption(modelLabel);
   const res = await runGroqWithFallback(
     (groq) => groq.chat.completions.create({
-      model: VISION_MODEL,
+      model: selected.text,
+      messages,
+      temperature: selected.temperature,
+    }),
+    { label: `chat ${selected.label}` }
+  );
+  const reply = normalizeText(res.choices[0]?.message?.content || "", MAX_JSON_TEXT_LENGTH);
+  if (!reply) {
+    throw new Error(`${selected.label} returned an empty reply`);
+  }
+  return { reply, tier: selected.label };
+}
+
+async function getVisionCompletion({ prompt, mimeType, imageBase64, systemPrompt = "", modelLabel = DEFAULT_MODEL_LABEL }) {
+  const selected = getModelOption(modelLabel);
+  const res = await runGroqWithFallback(
+    (groq) => groq.chat.completions.create({
+      model: selected.vision,
       temperature: 0.4,
       messages: [
         {
@@ -499,7 +512,7 @@ async function transcribeAudio({ audioFile, prompt = "" }) {
   return text;
 }
 
-async function getTextReplyWithMemory({ message, userId, conversationId, systemPrompt, history }) {
+async function getTextReplyWithMemory({ message, userId, conversationId, systemPrompt, history, modelLabel }) {
   const cleanedMessage = normalizeText(message);
   if (!cleanedMessage) throw new Error("No message provided");
 
@@ -538,7 +551,7 @@ async function getTextReplyWithMemory({ message, userId, conversationId, systemP
     },
   ];
 
-  const { reply, tier } = await getChatCompletion(finalMessages);
+  const { reply, tier } = await getChatCompletion(finalMessages, modelLabel);
   const updatedHistory = [
     ...baseHistory,
     { role: "user", content: cleanedMessage },
@@ -584,10 +597,8 @@ app.get("/api/config", (_req, res) => {
   res.json({
     ok: true,
     aiName: IDENTITY.aiName,
-    model: PRIMARY_MODEL,
-    vision_model: VISION_MODEL,
-    secondary_model: SECONDARY_MODEL,
-    transcription_model: WHISPER_MODEL,
+    models: Object.keys(MODEL_OPTIONS),
+    default_model: DEFAULT_MODEL_LABEL,
     web_search_available: Boolean(process.env.TAVILY_API_KEY),
     voice_transcription_available: getGroqApiEntries().length > 0,
     image_upload_limit_mb: 8,
@@ -629,7 +640,6 @@ app.post(
         ok: true,
         text,
         meta: {
-          model: WHISPER_MODEL,
           file_name: sanitizeFileName(audioFile.originalname),
         },
       });
@@ -642,7 +652,18 @@ app.post(
 
 app.post(
   "/api/chat",
-  rateLimit({ windowMs: 60000, max: 25 }),
+  rateLimit({
+    windowMs: 1000,
+    max: 1,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: {
+      ok: false,
+      error: "Slow down",
+      details: "PMCAI accepts 1 text request per second.",
+      code: "RATE_LIMITED",
+    },
+  }),
   imageUpload.single("image"),
   async (req, res) => {
     try {
@@ -650,6 +671,7 @@ app.post(
       const userId = req.ip;
       const imageFile = req.file;
       const conversationId = normalizeText(req.body?.conversationId, 120) || "default";
+      const modelLabel = normalizeModelLabel(normalizeText(req.body?.model, 20));
       const systemPrompt = normalizeText(req.body?.systemPrompt, 4000);
       const history = parseHistoryInput(req.body?.history);
 
@@ -665,6 +687,7 @@ app.post(
             mimeType: imageFile.mimetype || "image/jpeg",
             imageBase64: imageFile.buffer.toString("base64"),
             systemPrompt,
+            modelLabel,
           });
 
           const assistantHistory = [
@@ -685,7 +708,7 @@ app.post(
             ok: true,
             reply,
             meta: {
-              tier_used: "Vision",
+              tier_used: modelLabel,
               vision_used: true,
               file_name: sanitizeFileName(imageFile.originalname),
               conversation_id: conversationId,
@@ -694,13 +717,14 @@ app.post(
         } catch (visionError) {
           console.log(`[ERROR] [UPLOAD] vision failed: ${visionError.message}`);
           const fallbackPrompt = message
-            || `The uploaded file "${sanitizeFileName(imageFile.originalname) || "image"}" could not be analyzed by the vision model. Respond helpfully without claiming to see the image.`;
+            || `The uploaded file "${sanitizeFileName(imageFile.originalname) || "image"}" could not be analyzed by PMCAI. Respond helpfully without claiming to see the image.`;
           const fallback = await getTextReplyWithMemory({
             message: fallbackPrompt,
             userId,
             conversationId,
             systemPrompt,
             history,
+            modelLabel,
           });
 
           logChatTranscript({
@@ -717,7 +741,6 @@ app.post(
               ...fallback.meta,
               vision_used: false,
               vision_fallback: true,
-              vision_error: visionError.message,
               file_name: sanitizeFileName(imageFile.originalname),
             },
           });
@@ -730,6 +753,7 @@ app.post(
         conversationId,
         systemPrompt,
         history,
+        modelLabel,
       });
 
       logChatTranscript({
@@ -742,7 +766,7 @@ app.post(
       return res.json({ ok: true, ...textResponse });
     } catch (err) {
       console.log(`[ERROR] [API] ${err.message}`);
-      return sendApiError(res, 500, "PMCAI request failed", err.message, "CHAT_FAILED");
+      return sendApiError(res, 500, "PMCAI request failed", "PMCAI could not complete this request. Please try again.", "CHAT_FAILED");
     }
   }
 );
