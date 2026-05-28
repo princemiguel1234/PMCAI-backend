@@ -17,17 +17,17 @@ const MODEL_OPTIONS = {
   "PMCAI 0": {
     text: "openai/gpt-oss-20b",
     vision: VISION_MODEL,
-    temperature: 0.6,
+    temperature: 0.1,
   },
   "PMCAI 1": {
     text: PRIMARY_MODEL,
     vision: VISION_MODEL,
-    temperature: 0.7,
+    temperature: 0.2,
   },
   "PMCAI 2": {
     text: SECONDARY_MODEL,
     vision: VISION_MODEL,
-    temperature: 0.6,
+    temperature: 0.1,
   },
 };
 const DEFAULT_MODEL_LABEL = "PMCAI 1";
