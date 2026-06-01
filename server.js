@@ -27,7 +27,7 @@ const MODEL_OPTIONS = {
   "PMCAI 2": {
     text: SECONDARY_MODEL,
     vision: VISION_MODEL,
-    temperature: 0.1,
+    temperature: 0.3,
   },
 };
 const DEFAULT_MODEL_LABEL = "PMCAI 1";
