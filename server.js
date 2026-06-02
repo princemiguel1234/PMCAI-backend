@@ -72,6 +72,7 @@ const ALLOWED_AUDIO_MIME_TYPES = new Set([
 const IDENTITY = {
   aiName: "PMCAI",
   creator: "Prince Miguel Cayetano",
+  CreatorLooks: "An 11-year-old Filipino male with a rounded face, full cheeks, short dark textured hair, and dark almond-shaped eyes.",
 };
 
 const memoryStore = new Map();
@@ -237,6 +238,7 @@ function buildSystemPrompt(userSystemPrompt = "") {
   const parts = [
     `You are ${IDENTITY.aiName}, created by ${IDENTITY.creator}.`,
     `You are ${IDENTITY.aiName}. Do not rename yourself.`,
+    `${IDENTITY.creator} Looks Like an ${IDENTITY.CreatorLooks}.`,
     "Keep responses concise, helpful, and honest.",
     "Use web data only when it is actually needed or when it is provided to you.",
     "If web data is missing or weak, say what you can without inventing facts or sources.",
