@@ -421,6 +421,40 @@ function tokenizeForSearch(value = "") {
     .filter((term) => term && (term.length >= 3 || /^\d{4}$/.test(term)) && !WEB_STOP_WORDS.has(term));
 }
 
+function isLikelyLocalOnlyTask(query = "") {
+  const value = normalizeWhitespace(query).toLowerCase();
+  if (!value) return true;
+
+  return [
+    /\b(write|draft|rewrite|rephrase|translate|summarize|proofread|brainstorm|roleplay|compose|generate)\b/,
+    /\b(code|function|regex|sql|html|css|javascript|python|bug|debug|refactor|algorithm)\b/,
+    /\b(calculate|solve|simplify|derive|integrate|differentiate)\b/,
+    /\b(explain|teach|define)\b.*\b(concept|idea|term|meaning|basics|like i'?m)\b/,
+  ].some((pattern) => pattern.test(value));
+}
+
+function hasNamedEntitySignal(query = "") {
+  const cleaned = normalizeText(query, 1000);
+  return /(?:^|\s)(?:[A-Z][a-z0-9&'.-]+(?:\s+[A-Z][a-z0-9&'.-]+){1,}|[A-Z]{2,})(?:\s|$)/.test(cleaned);
+}
+
+function isExternalFactualLookup(query = "") {
+  const raw = normalizeText(query, 8000);
+  const value = raw.toLowerCase();
+  const factualWritingTask = /\b(bio|biography|profile|background|timeline|history)\s+(?:of|for|about)\b/.test(value);
+  if (!value || (isLikelyLocalOnlyTask(raw) && !factualWritingTask)) return false;
+
+  return [
+    /\b(who is|who are|who was|what is|what are|what was|when is|when did|where is|where are|which is|which are|how many|how much)\b/,
+    /\b(according to|source|sources|citation|cite|verify|fact check|evidence|statistics|data|report|study|survey|poll)\b/,
+    /\b(ceo|cfo|cto|founder|owner|president|prime minister|minister|governor|mayor|chairman|director|headquarters|address|phone|hours|location|population|capital)\b/,
+    /\b(company|startup|organization|university|school|hospital|restaurant|hotel|airport|agency|department|government|court|law|bill|regulation|policy)\b/,
+    /\b(product|model|specs|specifications|pricing|availability|release|released|launch|launched|version|docs|documentation|api reference)\b/,
+    /\b(medical|health|drug|medicine|dosage|symptom|treatment|legal|tax|financial|investment|insurance|mortgage)\b/,
+    /\b(event|conference|concert|movie|game|match|election|award|schedule|score|standings)\b/,
+  ].some((pattern) => pattern.test(value)) || factualWritingTask || hasNamedEntitySignal(raw);
+}
+
 function detectSearchIntent(query = "") {
   const value = normalizeText(query, 8000).toLowerCase();
   const explicit = /https?:\/\//i.test(value)
@@ -428,6 +462,7 @@ function detectSearchIntent(query = "") {
   const timeSensitive = /\b(latest|current|currently|today|tonight|yesterday|last night|tomorrow|this week|next week|this month|recent|breaking|right now|live|as of|newly|just announced)\b/i.test(value);
   const dataLookup = /\b(price|stock|share price|market cap|exchange rate|score|standings|schedule|release date|version|changelog|update|status|weather|forecast|who won|what happened|what is happening)\b/i.test(value)
     || /\b(202[5-9]|203\d)\b.*\b(news|update|latest|current|released?|announced?|version)\b/i.test(value);
+  const externalFactual = isExternalFactualLookup(query);
   const finance = /\b(stock|share price|market cap|ticker|nasdaq|nyse|earnings|revenue|crypto|bitcoin|ethereum|exchange rate|forex|interest rate|cpi|inflation|bond yield)\b/i.test(value);
   const news = /\b(news|breaking|today|tonight|this week|current events|what happened|what is happening|live|election|war|conflict|storm|earthquake|who won|score|standings)\b/i.test(value);
 
@@ -440,6 +475,8 @@ function detectSearchIntent(query = "") {
     explicit,
     timeSensitive,
     dataLookup,
+    externalFactual,
+    reason: explicit ? "explicit" : (timeSensitive ? "current" : (dataLookup ? "data_lookup" : (externalFactual ? "external_factual" : "none"))),
     topic: finance ? "finance" : (news ? "news" : "general"),
     timeRange,
   };
@@ -459,7 +496,8 @@ function buildSearchPlan(message = "") {
     terms,
     includeDomains,
     excludeDomains: getExcludedWebDomains(query, includeDomains),
-    needsWeb: Boolean(query) && (intent.explicit || intent.timeSensitive || intent.dataLookup || includeDomains.length > 0),
+    needsWeb: Boolean(query) && (intent.explicit || intent.timeSensitive || intent.dataLookup || intent.externalFactual || includeDomains.length > 0),
+    reason: includeDomains.length > 0 ? "site_filter" : intent.reason,
     topic: intent.topic,
     timeRange: intent.timeRange,
     days: intent.timeRange === "day" ? 1 : (intent.timeRange === "week" ? 7 : (intent.timeRange === "month" ? 30 : undefined)),
@@ -755,6 +793,7 @@ async function searchWeb(searchPlan) {
       error: "Missing TAVILY_API_KEY",
       topic: plan.topic,
       timeRange: plan.timeRange,
+      reason: plan.reason,
     };
   }
 
@@ -775,7 +814,7 @@ async function searchWeb(searchPlan) {
     const results = normalizeAndRankSearchResults(rawResults, plan);
     const answer = normalizeText(data.answer, 1400);
     const contextText = results.length ? buildWebContext({ answer, results, plan }) : "";
-    console.log(`[WEB] query="${plan.query}" topic=${plan.topic} time=${plan.timeRange || "none"} results=${results.length}/${rawResults.length}`);
+    console.log(`[WEB] query="${plan.query}" reason=${plan.reason} topic=${plan.topic} time=${plan.timeRange || "none"} results=${results.length}/${rawResults.length}`);
 
     return {
       used: Boolean(results.length),
@@ -786,6 +825,7 @@ async function searchWeb(searchPlan) {
       error: "",
       topic: plan.topic,
       timeRange: plan.timeRange,
+      reason: plan.reason,
       rawResultsCount: rawResults.length,
     };
   } catch (error) {
@@ -799,6 +839,7 @@ async function searchWeb(searchPlan) {
       error: error.message,
       topic: plan.topic,
       timeRange: plan.timeRange,
+      reason: plan.reason,
     };
   } finally {
     clearTimeout(timeoutId);
@@ -918,7 +959,7 @@ async function getTextReplyWithMemory({ message, userId, conversationId, systemP
   const baseHistory = providedHistory.length ? providedHistory : getStoredHistory(memoryKey);
   const searchPlan = buildSearchPlan(cleanedMessage);
   const needsWeb = searchPlan.needsWeb;
-  console.log(`[WEB] requested=${needsWeb} query="${searchPlan.query}" topic=${searchPlan.topic} time=${searchPlan.timeRange || "none"}`);
+  console.log(`[WEB] requested=${needsWeb} reason=${searchPlan.reason} query="${searchPlan.query}" topic=${searchPlan.topic} time=${searchPlan.timeRange || "none"}`);
 
   const webSearch = needsWeb ? await searchWeb(searchPlan) : {
     used: false,
@@ -929,6 +970,7 @@ async function getTextReplyWithMemory({ message, userId, conversationId, systemP
     error: "",
     topic: searchPlan.topic,
     timeRange: searchPlan.timeRange,
+    reason: searchPlan.reason,
     rawResultsCount: 0,
   };
 
@@ -967,6 +1009,7 @@ async function getTextReplyWithMemory({ message, userId, conversationId, systemP
       web_requested: needsWeb,
       web_used: Boolean(webSearch.used),
       web_query: webSearch.query,
+      web_reason: webSearch.reason || searchPlan.reason,
       web_topic: webSearch.topic,
       web_time_range: webSearch.timeRange || undefined,
       web_results_count: webSearch.results.length,
