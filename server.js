@@ -459,8 +459,23 @@ async function getChatCompletion(messages, modelLabel = DEFAULT_MODEL_LABEL) {
   return { reply, tier: selected.label };
 }
 
-async function getVisionCompletion({ prompt, mimeType, imageBase64, systemPrompt = "", modelLabel = DEFAULT_MODEL_LABEL }) {
+function buildVisionPrompt({ prompt, history = [], fileName = "" }) {
+  const cleanedPrompt = normalizeText(prompt) || "What is in this image?";
+  const recentContext = compactHistory(history, 6)
+    .map((entry) => `${entry.role === "assistant" ? "Assistant" : "User"}: ${entry.content}`)
+    .join("\n");
+
+  return [
+    "Answer the user's prompt using the attached image.",
+    fileName ? `Attached image file: ${sanitizeFileName(fileName)}` : "",
+    recentContext ? `Recent conversation context:\n${recentContext}` : "",
+    `User prompt for this image:\n${cleanedPrompt}`,
+  ].filter(Boolean).join("\n\n");
+}
+
+async function getVisionCompletion({ prompt, mimeType, imageBase64, systemPrompt = "", modelLabel = DEFAULT_MODEL_LABEL, history = [], fileName = "" }) {
   const selected = getModelOption(modelLabel);
+  const visionPrompt = buildVisionPrompt({ prompt, history, fileName });
   const res = await runGroqWithFallback(
     (groq) => groq.chat.completions.create({
       model: selected.vision,
@@ -473,7 +488,7 @@ async function getVisionCompletion({ prompt, mimeType, imageBase64, systemPrompt
         {
           role: "user",
           content: [
-            { type: "text", text: prompt || "What is in this image?" },
+            { type: "text", text: visionPrompt },
             {
               type: "image_url",
               image_url: {
@@ -667,7 +682,7 @@ app.post(
   imageUpload.single("image"),
   async (req, res) => {
     try {
-      const message = normalizeText(req.body?.message);
+      const message = normalizeText(req.body?.message || req.body?.imagePrompt || req.body?.prompt);
       const userId = req.ip;
       const imageFile = req.file;
       const conversationId = normalizeText(req.body?.conversationId, 120) || "default";
@@ -680,19 +695,23 @@ app.post(
       }
 
       if (imageFile && isImageMimeType(imageFile.mimetype)) {
-        console.log(`[UPLOAD] image ${sanitizeFileName(imageFile.originalname)} type=${imageFile.mimetype} bytes=${imageFile.size}`);
+        const imagePrompt = message || "What is in this image?";
+        const imageFileName = sanitizeFileName(imageFile.originalname || "upload-image");
+        console.log(`[UPLOAD] image ${imageFileName} type=${imageFile.mimetype} bytes=${imageFile.size} prompt=${Boolean(message)}`);
         try {
           const reply = await getVisionCompletion({
-            prompt: message || "What is in this image?",
+            prompt: imagePrompt,
             mimeType: imageFile.mimetype || "image/jpeg",
             imageBase64: imageFile.buffer.toString("base64"),
             systemPrompt,
             modelLabel,
+            history,
+            fileName: imageFileName,
           });
 
           const assistantHistory = [
             ...history.slice(-MAX_HISTORY_MESSAGES),
-            { role: "user", content: message || "What is in this image?" },
+            { role: "user", content: imagePrompt },
             { role: "assistant", content: reply },
           ];
           saveStoredHistory(buildConversationKey({ userId, conversationId }), assistantHistory);
@@ -700,7 +719,7 @@ app.post(
           logChatTranscript({
             ip: userId,
             conversationId,
-            userMessage: message || `[image] ${imageFile.originalname || "upload"}`,
+            userMessage: message ? `[image: ${imageFileName}] ${message}` : `[image] ${imageFileName}`,
             aiMessage: reply,
           });
 
@@ -710,14 +729,15 @@ app.post(
             meta: {
               tier_used: modelLabel,
               vision_used: true,
-              file_name: sanitizeFileName(imageFile.originalname),
+              prompt_used: imagePrompt,
+              file_name: imageFileName,
               conversation_id: conversationId,
             },
           });
         } catch (visionError) {
           console.log(`[ERROR] [UPLOAD] vision failed: ${visionError.message}`);
           const fallbackPrompt = message
-            || `The uploaded file "${sanitizeFileName(imageFile.originalname) || "image"}" could not be analyzed by PMCAI. Respond helpfully without claiming to see the image.`;
+            || `The uploaded file "${imageFileName}" could not be analyzed by PMCAI. Respond helpfully without claiming to see the image.`;
           const fallback = await getTextReplyWithMemory({
             message: fallbackPrompt,
             userId,
@@ -741,7 +761,8 @@ app.post(
               ...fallback.meta,
               vision_used: false,
               vision_fallback: true,
-              file_name: sanitizeFileName(imageFile.originalname),
+              prompt_used: fallbackPrompt,
+              file_name: imageFileName,
             },
           });
         }
