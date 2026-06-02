@@ -35,12 +35,14 @@ const DEFAULT_MODEL_LABEL = "PMCAI 1";
 const MAX_HISTORY_MESSAGES = 14;
 const MAX_MEMORY_MESSAGES = 20;
 const MEMORY_TTL_MS = 6 * 60 * 60 * 1000;
-const SEARCH_TIMEOUT_MS = 12000;
+const SEARCH_TIMEOUT_MS = 18000;
 const GROQ_TIMEOUT_MS = 45000;
 const TRANSCRIPTION_TIMEOUT_MS = 35000;
-const MAX_WEB_RESULTS = 5;
-const WEB_QUERY_CHAR_LIMIT = 500;
-const WEB_CONTEXT_CHAR_LIMIT = 5000;
+const MAX_WEB_RESULTS = 6;
+const TAVILY_FETCH_RESULTS = 12;
+const WEB_QUERY_CHAR_LIMIT = 420;
+const WEB_CONTEXT_CHAR_LIMIT = 9000;
+const WEB_SOURCE_SNIPPET_LIMIT = 1400;
 const IMAGE_UPLOAD_LIMIT_BYTES = 8 * 1024 * 1024;
 const AUDIO_UPLOAD_LIMIT_BYTES = 25 * 1024 * 1024;
 const MAX_JSON_TEXT_LENGTH = 20000;
@@ -312,67 +314,445 @@ async function runGroqWithFallback(requestFactory, options = {}) {
   throw lastError || new Error(`All Groq API keys failed for ${label}`);
 }
 
-function buildSearchQuerySimple(message = "") {
-  const cleaned = normalizeText(message, 8000);
+const WEB_STOP_WORDS = new Set([
+  "about", "after", "again", "also", "and", "any", "are", "around", "ask", "best", "but", "can",
+  "could", "did", "does", "for", "from", "get", "give", "has", "have", "help", "how", "into",
+  "latest", "like", "look", "make", "most", "near", "new", "news", "now", "online", "please",
+  "recent", "search", "show", "tell", "than", "that", "the", "their", "them", "then", "there",
+  "these", "this", "today", "use", "using", "was", "web", "were", "what", "when", "where",
+  "which", "while", "who", "why", "with", "would", "you", "your",
+]);
+
+const DEFAULT_EXCLUDED_WEB_DOMAINS = [
+  "pinterest.com",
+  "facebook.com",
+  "instagram.com",
+  "tiktok.com",
+  "x.com",
+  "twitter.com",
+  "youtube.com",
+  "youtu.be",
+  "quora.com",
+  "answers.com",
+  "slideshare.net",
+];
+
+const DISCUSSION_DOMAINS = [
+  "reddit.com",
+  "quora.com",
+  "stackoverflow.com",
+  "stackexchange.com",
+  "medium.com",
+  "substack.com",
+  "github.com",
+  "news.ycombinator.com",
+];
+
+const HIGH_QUALITY_DOMAINS = new Set([
+  "apnews.com",
+  "bbc.com",
+  "bbc.co.uk",
+  "bls.gov",
+  "cdc.gov",
+  "census.gov",
+  "cnbc.com",
+  "docs.tavily.com",
+  "ecb.europa.eu",
+  "federalreserve.gov",
+  "ft.com",
+  "imf.org",
+  "nih.gov",
+  "nvidia.com",
+  "openai.com",
+  "reuters.com",
+  "sec.gov",
+  "statista.com",
+  "theguardian.com",
+  "who.int",
+  "worldbank.org",
+]);
+
+function extractUserSearchText(message = "") {
+  const cleaned = normalizeText(message, 12000);
   if (!cleaned) return "";
 
   const userLines = [...cleaned.matchAll(/(?:^|\n)User:\s*(.+)/gim)];
   const lastUserLine = userLines.at(-1)?.[1];
-  if (lastUserLine) {
-    return normalizeWhitespace(lastUserLine).slice(0, WEB_QUERY_CHAR_LIMIT);
-  }
+  if (lastUserLine) return normalizeWhitespace(lastUserLine);
 
   const explicitQuestion = cleaned.match(/QUESTION:\s*([\s\S]+)/i)?.[1];
-  if (explicitQuestion) {
-    return normalizeWhitespace(explicitQuestion).slice(0, WEB_QUERY_CHAR_LIMIT);
-  }
+  if (explicitQuestion) return normalizeWhitespace(explicitQuestion);
 
-  return normalizeWhitespace(cleaned).slice(0, WEB_QUERY_CHAR_LIMIT);
+  return normalizeWhitespace(cleaned);
+}
+
+function extractSiteDomains(query = "") {
+  const includeDomains = [];
+  const cleaned = String(query).replace(/\bsite:([a-z0-9.-]+\.[a-z]{2,})(?:\/[^\s]*)?/gi, (_match, domain) => {
+    includeDomains.push(domain.toLowerCase().replace(/^www\./, ""));
+    return " ";
+  });
+
+  return {
+    query: normalizeWhitespace(cleaned),
+    includeDomains: [...new Set(includeDomains)],
+  };
+}
+
+function cleanSearchQuery(query = "") {
+  return normalizeWhitespace(query)
+    .replace(/^\s*(?:please\s+)?(?:search|look up|lookup|browse|google|find)\s+(?:the\s+)?(?:web|internet|online)?\s*(?:for|about)?\s*/i, "")
+    .replace(/\b(?:use|search)\s+(?:the\s+)?web\b/gi, " ")
+    .replace(/\b(?:current|latest|recent)\s+(?:info|information|data)\s+(?:on|about)\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, WEB_QUERY_CHAR_LIMIT);
+}
+
+function tokenizeForSearch(value = "") {
+  return normalizeWhitespace(value)
+    .toLowerCase()
+    .replace(/https?:\/\/\S+/g, " ")
+    .replace(/[^a-z0-9.\-\s]/g, " ")
+    .split(/\s+/)
+    .map((term) => term.replace(/^[.\-]+|[.\-]+$/g, ""))
+    .filter((term) => term && (term.length >= 3 || /^\d{4}$/.test(term)) && !WEB_STOP_WORDS.has(term));
+}
+
+function detectSearchIntent(query = "") {
+  const value = normalizeText(query, 8000).toLowerCase();
+  const explicit = /https?:\/\//i.test(value)
+    || /\b(search|look up|lookup|browse|google|web|internet|online)\b/i.test(value);
+  const timeSensitive = /\b(latest|current|currently|today|tonight|yesterday|last night|tomorrow|this week|next week|this month|recent|breaking|right now|live|as of|newly|just announced)\b/i.test(value);
+  const dataLookup = /\b(price|stock|share price|market cap|exchange rate|score|standings|schedule|release date|version|changelog|update|status|weather|forecast|who won|what happened|what is happening)\b/i.test(value)
+    || /\b(202[5-9]|203\d)\b.*\b(news|update|latest|current|released?|announced?|version)\b/i.test(value);
+  const finance = /\b(stock|share price|market cap|ticker|nasdaq|nyse|earnings|revenue|crypto|bitcoin|ethereum|exchange rate|forex|interest rate|cpi|inflation|bond yield)\b/i.test(value);
+  const news = /\b(news|breaking|today|tonight|this week|current events|what happened|what is happening|live|election|war|conflict|storm|earthquake|who won|score|standings)\b/i.test(value);
+
+  let timeRange = "";
+  if (/\b(today|tonight|yesterday|last night|tomorrow|right now|live|breaking|currently|weather|forecast)\b/i.test(value)) timeRange = "day";
+  else if (/\b(this week|next week|past week|recent|latest|newly|just announced)\b/i.test(value)) timeRange = "week";
+  else if (/\b(this month|current|update|release|released|changelog|version)\b/i.test(value)) timeRange = "month";
+
+  return {
+    explicit,
+    timeSensitive,
+    dataLookup,
+    topic: finance ? "finance" : (news ? "news" : "general"),
+    timeRange,
+  };
+}
+
+function buildSearchPlan(message = "") {
+  const rawQuery = extractUserSearchText(message);
+  const domainPlan = extractSiteDomains(rawQuery);
+  const query = cleanSearchQuery(domainPlan.query) || normalizeWhitespace(rawQuery).slice(0, WEB_QUERY_CHAR_LIMIT);
+  const intent = detectSearchIntent(rawQuery);
+  const terms = [...new Set(tokenizeForSearch(query))];
+  const includeDomains = domainPlan.includeDomains;
+
+  return {
+    rawQuery,
+    query,
+    terms,
+    includeDomains,
+    excludeDomains: getExcludedWebDomains(query, includeDomains),
+    needsWeb: Boolean(query) && (intent.explicit || intent.timeSensitive || intent.dataLookup || includeDomains.length > 0),
+    topic: intent.topic,
+    timeRange: intent.timeRange,
+    days: intent.timeRange === "day" ? 1 : (intent.timeRange === "week" ? 7 : (intent.timeRange === "month" ? 30 : undefined)),
+  };
+}
+
+function buildSearchQuerySimple(message = "") {
+  return buildSearchPlan(message).query;
 }
 
 function shouldUseWebSimple(message = "") {
-  const value = normalizeText(message, 8000).toLowerCase();
-  if (!value) return false;
-
-  return [
-    /https?:\/\//i,
-    /\b(search|look up|lookup|browse|google|web|internet|online)\b/i,
-    /\b(latest|current|currently|today|tonight|this week|this month|recent|breaking|news|weather|forecast|right now|live)\b/i,
-    /\b(price|stock|market cap|exchange rate|score|standings|schedule|release date|version|changelog|update|status)\b/i,
-    /\b(what happened|what is happening|who won|when is|where is|live update|as of)\b/i,
-    /\b(202[5-9]|203\d)\b.*\b(news|update|latest|current|released?|announced?)\b/i,
-  ].some((pattern) => pattern.test(value));
+  return buildSearchPlan(message).needsWeb;
 }
 
-function buildWebContext({ answer, results }) {
-  const sections = [];
+function domainMatches(domain = "", target = "") {
+  const cleanDomain = String(domain).toLowerCase().replace(/^www\./, "");
+  const cleanTarget = String(target).toLowerCase().replace(/^www\./, "");
+  return cleanDomain === cleanTarget || cleanDomain.endsWith(`.${cleanTarget}`);
+}
+
+function queryMentionsDomain(query = "", domain = "") {
+  const lower = query.toLowerCase();
+  const cleanDomain = domain.toLowerCase().replace(/^www\./, "");
+  const base = cleanDomain.split(".")[0];
+  return lower.includes(cleanDomain) || (base.length > 3 && lower.includes(base));
+}
+
+function getExcludedWebDomains(query = "", includeDomains = []) {
+  if (includeDomains.length) return [];
+  return DEFAULT_EXCLUDED_WEB_DOMAINS.filter((domain) => !queryMentionsDomain(query, domain));
+}
+
+function canonicalizeUrl(value = "") {
+  try {
+    const parsed = new URL(value);
+    if (!["http:", "https:"].includes(parsed.protocol)) return null;
+    parsed.hash = "";
+    for (const key of [...parsed.searchParams.keys()]) {
+      if (/^(utm_|fbclid$|gclid$|mc_|ref$|ref_src$|igshid$)/i.test(key)) {
+        parsed.searchParams.delete(key);
+      }
+    }
+    parsed.hostname = parsed.hostname.toLowerCase().replace(/^www\./, "");
+    parsed.pathname = parsed.pathname.replace(/\/{2,}/g, "/").replace(/\/$/, "") || "/";
+    return {
+      url: parsed.toString(),
+      domain: parsed.hostname,
+      pathname: parsed.pathname,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function normalizeSearchResult(result = {}) {
+  const canonical = canonicalizeUrl(normalizeText(result.url, 800));
+  if (!canonical) return null;
+
+  const rawContent = typeof result.raw_content === "string"
+    ? result.raw_content
+    : (typeof result.rawContent === "string" ? result.rawContent : "");
+
+  return {
+    title: normalizeText(result.title, 220) || canonical.domain,
+    url: canonical.url,
+    domain: canonical.domain,
+    pathname: canonical.pathname,
+    content: normalizeText(result.content, 2600),
+    rawContent: normalizeText(rawContent, 7000),
+    publishedDate: normalizeText(result.published_date || result.publishedDate || "", 80),
+    score: typeof result.score === "number" ? result.score : 0,
+  };
+}
+
+function isNoisyResult(result, plan) {
+  if (!result?.url) return true;
+  if (plan.includeDomains.length && !plan.includeDomains.some((domain) => domainMatches(result.domain, domain))) return true;
+  if (plan.excludeDomains.some((domain) => domainMatches(result.domain, domain))) return true;
+  if (/\/(?:search|tag|tags|category|author)(?:\/|$)/i.test(result.pathname) && result.content.length < 500) return true;
+  if (/\b(search results|tag archive|log in|sign up|subscribe to continue)\b/i.test(result.title) && result.content.length < 500) return true;
+  if ((result.content + result.rawContent).length < 80) return true;
+  return false;
+}
+
+function textTermOverlap(text = "", terms = []) {
+  if (!terms.length) return 0;
+  const lower = ` ${normalizeWhitespace(text).toLowerCase()} `;
+  let matches = 0;
+  for (const term of terms) {
+    if (lower.includes(term)) matches += 1;
+  }
+  return matches / terms.length;
+}
+
+function sourceQualityScore(result, plan) {
+  let score = 0;
+  const domain = result.domain;
+  const domainTokens = domain.split(/[.\-]/).filter((token) => token.length >= 4);
+  const queryTerms = new Set(plan.terms);
+
+  if (domain.endsWith(".gov")) score += 0.9;
+  if (domain.endsWith(".edu")) score += 0.55;
+  if (HIGH_QUALITY_DOMAINS.has(domain)) score += 0.45;
+  if (/^(docs|developer|support|help)\./.test(domain) || /\/(?:docs|documentation|api|reference)(?:\/|$)/i.test(result.pathname)) score += 0.25;
+  if (domainTokens.some((token) => queryTerms.has(token))) score += 0.35;
+  if (DISCUSSION_DOMAINS.some((source) => domainMatches(domain, source)) && !queryMentionsDomain(plan.query, domain)) score -= 0.45;
+  if (/\b(blog|opinion|sponsored|coupon|promo|affiliate|top \d+|best \d+)\b/i.test(`${result.title} ${result.pathname}`)) score -= 0.35;
+  if (/\b(yahoo.com|msn.com|aol.com|flipboard.com)\b/i.test(domain)) score -= 0.25;
+
+  return score;
+}
+
+function recencyScore(result, plan) {
+  if (!plan.timeRange || !result.publishedDate) return 0;
+  const timestamp = Date.parse(result.publishedDate);
+  if (!Number.isFinite(timestamp)) return 0;
+  const ageDays = (Date.now() - timestamp) / 86400000;
+  if (ageDays <= 2) return 0.5;
+  if (ageDays <= 7) return 0.35;
+  if (ageDays <= 30) return 0.2;
+  if (ageDays <= 365) return 0.05;
+  return -0.25;
+}
+
+function rankSearchResult(result, plan) {
+  const titleOverlap = textTermOverlap(result.title, plan.terms);
+  const contentOverlap = textTermOverlap(`${result.content}\n${result.rawContent}`, plan.terms);
+  const tavilyScore = Math.min(Math.max(result.score || 0, 0), 1);
+
+  return tavilyScore * 1.2
+    + titleOverlap * 2.4
+    + contentOverlap * 2.8
+    + sourceQualityScore(result, plan)
+    + recencyScore(result, plan);
+}
+
+function splitEvidenceChunks(text = "") {
+  const cleaned = normalizeText(text, 9000);
+  if (!cleaned) return [];
+  return cleaned
+    .split(/\n{2,}|[.!?]\s+/)
+    .map((chunk) => normalizeWhitespace(chunk))
+    .filter((chunk) => chunk.length >= 70 && chunk.length <= 1600);
+}
+
+function buildEvidenceSnippet(result, terms) {
+  const chunks = [
+    ...splitEvidenceChunks(result.content),
+    ...splitEvidenceChunks(result.rawContent),
+  ];
+
+  const selected = chunks
+    .map((chunk) => ({
+      chunk,
+      score: textTermOverlap(chunk, terms) + Math.min(chunk.length / 1200, 0.25),
+    }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 3)
+    .map((entry) => entry.chunk);
+
+  const evidence = selected.length
+    ? selected.join("\n")
+    : normalizeText(result.content || result.rawContent, WEB_SOURCE_SNIPPET_LIMIT);
+
+  return evidence.slice(0, WEB_SOURCE_SNIPPET_LIMIT);
+}
+
+function dedupeAndLimitResults(results, limit, plan) {
+  const selected = [];
+  const seenUrls = new Set();
+  const seenTitles = new Set();
+  const domainCounts = new Map();
+  const maxPerDomain = plan.includeDomains.length ? 4 : 2;
+
+  for (const result of results) {
+    const titleKey = normalizeWhitespace(result.title).toLowerCase();
+    if (seenUrls.has(result.url) || seenTitles.has(titleKey)) continue;
+    const domainCount = domainCounts.get(result.domain) || 0;
+    if (domainCount >= maxPerDomain) continue;
+
+    selected.push(result);
+    seenUrls.add(result.url);
+    seenTitles.add(titleKey);
+    domainCounts.set(result.domain, domainCount + 1);
+    if (selected.length >= limit) return selected;
+  }
+
+  return selected;
+}
+
+function normalizeAndRankSearchResults(rawResults = [], plan) {
+  const normalized = rawResults
+    .map(normalizeSearchResult)
+    .filter(Boolean);
+  let candidates = normalized.filter((result) => !isNoisyResult(result, plan));
+  if (candidates.length < 3 && normalized.length > candidates.length && plan.excludeDomains.length) {
+    const relaxedPlan = { ...plan, excludeDomains: [] };
+    candidates = normalized.filter((result) => !isNoisyResult(result, relaxedPlan));
+  }
+
+  const ranked = candidates
+    .map((result) => ({
+      ...result,
+      relevance: rankSearchResult(result, plan),
+      evidence: buildEvidenceSnippet(result, plan.terms),
+    }))
+    .sort((a, b) => b.relevance - a.relevance);
+
+  return dedupeAndLimitResults(ranked, MAX_WEB_RESULTS, plan);
+}
+
+function buildWebContext({ answer, results, plan }) {
+  const sections = [
+    `SEARCH QUERY:\n${plan.query}`,
+  ];
 
   if (answer) {
-    sections.push(`WEB SUMMARY:\n${normalizeText(answer, 1200)}`);
+    sections.push(`TAVILY DRAFT ANSWER (cross-check against the sources below before using):\n${normalizeText(answer, 1400)}`);
   }
 
   if (results.length) {
-    sections.push("WEB SOURCES:");
+    sections.push("RANKED WEB SOURCES:");
     for (const [index, result] of results.entries()) {
-      sections.push(
-        `${index + 1}. ${result.title}\nURL: ${result.url}\nSnippet: ${normalizeText(result.content, 700)}`
-      );
+      sections.push([
+        `[${index + 1}] ${result.title}`,
+        `URL: ${result.url}`,
+        `Domain: ${result.domain}`,
+        result.publishedDate ? `Published/updated: ${result.publishedDate}` : "",
+        `Local relevance: ${result.relevance.toFixed(2)}`,
+        `Evidence:\n${normalizeText(result.evidence || result.content, WEB_SOURCE_SNIPPET_LIMIT)}`,
+      ].filter(Boolean).join("\n"));
     }
   }
 
   return sections.join("\n\n").slice(0, WEB_CONTEXT_CHAR_LIMIT);
 }
 
-async function searchWeb(query) {
+function buildTavilyRequestBody(apiKey, plan, modern = true) {
+  const body = {
+    api_key: apiKey,
+    query: plan.query,
+    topic: plan.topic,
+    search_depth: "advanced",
+    include_answer: modern ? "advanced" : true,
+    include_raw_content: modern ? "markdown" : true,
+    max_results: TAVILY_FETCH_RESULTS,
+    exclude_domains: plan.excludeDomains,
+  };
+
+  if (modern) {
+    body.auto_parameters = true;
+    body.chunks_per_source = 3;
+  }
+  if (plan.includeDomains.length) body.include_domains = plan.includeDomains;
+  if (plan.timeRange) body.time_range = plan.timeRange;
+  if (plan.topic === "news" && plan.days) body.days = plan.days;
+
+  return body;
+}
+
+async function fetchTavilySearch(apiKey, body, signal) {
+  const res = await fetch("https://api.tavily.com/search", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+      "X-API-Key": apiKey,
+    },
+    body: JSON.stringify(body),
+    signal,
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    const error = new Error(`Tavily ${res.status}: ${text.slice(0, 300)}`);
+    error.status = res.status;
+    throw error;
+  }
+
+  return res.json();
+}
+
+async function searchWeb(searchPlan) {
+  const plan = typeof searchPlan === "string" ? buildSearchPlan(searchPlan) : searchPlan;
   const apiKey = process.env.TAVILY_API_KEY;
   if (!apiKey) {
     return {
       used: false,
-      query,
+      query: plan.query,
       results: [],
       answer: "",
       contextText: "",
       error: "Missing TAVILY_API_KEY",
+      topic: plan.topic,
+      timeRange: plan.timeRange,
     };
   }
 
@@ -380,62 +760,43 @@ async function searchWeb(query) {
   const timeoutId = setTimeout(() => controller.abort(), SEARCH_TIMEOUT_MS);
 
   try {
-    const res = await fetch("https://api.tavily.com/search", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-        "X-API-Key": apiKey,
-      },
-      body: JSON.stringify({
-        api_key: apiKey,
-        query,
-        search_depth: "basic",
-        include_answer: true,
-        include_raw_content: false,
-        max_results: MAX_WEB_RESULTS,
-      }),
-      signal: controller.signal,
-    });
-
-    if (!res.ok) {
-      const text = await res.text();
-      throw new Error(`Tavily ${res.status}: ${text.slice(0, 200)}`);
+    let data;
+    try {
+      data = await fetchTavilySearch(apiKey, buildTavilyRequestBody(apiKey, plan, true), controller.signal);
+    } catch (error) {
+      if (error.status !== 400) throw error;
+      console.log(`[WEB] retrying Tavily with legacy-compatible parameters: ${error.message}`);
+      data = await fetchTavilySearch(apiKey, buildTavilyRequestBody(apiKey, plan, false), controller.signal);
     }
 
-    const data = await res.json();
-    const results = Array.isArray(data.results)
-      ? data.results
-          .map((result) => ({
-            title: normalizeText(result.title, 200) || "Untitled source",
-            url: normalizeText(result.url, 500),
-            content: normalizeText(result.content, 900),
-            score: typeof result.score === "number" ? result.score : null,
-          }))
-          .filter((result) => result.url || result.content)
-      : [];
-
-    const answer = normalizeText(data.answer, 1200);
-    const contextText = buildWebContext({ answer, results });
-    console.log(`[WEB] query="${query}" results=${results.length}`);
+    const rawResults = Array.isArray(data.results) ? data.results : [];
+    const results = normalizeAndRankSearchResults(rawResults, plan);
+    const answer = normalizeText(data.answer, 1400);
+    const contextText = results.length ? buildWebContext({ answer, results, plan }) : "";
+    console.log(`[WEB] query="${plan.query}" topic=${plan.topic} time=${plan.timeRange || "none"} results=${results.length}/${rawResults.length}`);
 
     return {
-      used: Boolean(answer || results.length),
-      query,
+      used: Boolean(results.length),
+      query: plan.query,
       answer,
       results,
       contextText,
       error: "",
+      topic: plan.topic,
+      timeRange: plan.timeRange,
+      rawResultsCount: rawResults.length,
     };
   } catch (error) {
     console.log(`[WEB] search failed: ${error.message}`);
     return {
       used: false,
-      query,
+      query: plan.query,
       results: [],
       answer: "",
       contextText: "",
       error: error.message,
+      topic: plan.topic,
+      timeRange: plan.timeRange,
     };
   } finally {
     clearTimeout(timeoutId);
@@ -459,17 +820,36 @@ async function getChatCompletion(messages, modelLabel = DEFAULT_MODEL_LABEL) {
   return { reply, tier: selected.label };
 }
 
+function isImageAnalysisPrompt(prompt = "") {
+  const value = normalizeWhitespace(prompt).toLowerCase();
+  return /\b(analy[sz]e|describe|caption|inspect|identify|recognize|ocr|transcribe|read|extract text)\b/.test(value)
+    || /\bwhat(?:'s| is)\s+(?:in|on|shown|pictured)\b/.test(value)
+    || /\bwhat do you see\b/.test(value)
+    || /\btell me\s+(?:what|who|where).*?(?:image|photo|picture|screenshot)\b/.test(value)
+    || /\b(?:image|photo|picture|screenshot)\s+(?:shows|says|contain|contains)\b/.test(value);
+}
+
 function buildVisionPrompt({ prompt, history = [], fileName = "" }) {
-  const cleanedPrompt = normalizeText(prompt) || "What is in this image?";
+  const cleanedPrompt = normalizeText(prompt);
+  const hasUserPrompt = Boolean(cleanedPrompt);
+  const requestsImageAnalysis = hasUserPrompt && isImageAnalysisPrompt(cleanedPrompt);
+  const primaryPrompt = cleanedPrompt || "Ask the user what they want to create or do with this attached reference image.";
   const recentContext = compactHistory(history, 6)
     .map((entry) => `${entry.role === "assistant" ? "Assistant" : "User"}: ${entry.content}`)
     .join("\n");
 
   return [
-    "Answer the user's prompt using the attached image.",
+    "Use the user's text as the main generation prompt.",
+    "Treat the attached image as a visual reference/input image.",
+    requestsImageAnalysis
+      ? "The user explicitly requested image analysis, so you may analyze or describe only the visual details needed to answer."
+      : "Do not automatically analyze, describe, caption, identify, or summarize the image. Do not start with observations about the image. Use the image only as supporting reference when it helps satisfy the user's text prompt.",
+    hasUserPrompt
+      ? ""
+      : "No text prompt was provided. Ask the user what they want done with the reference image instead of describing the image.",
     fileName ? `Attached image file: ${sanitizeFileName(fileName)}` : "",
     recentContext ? `Recent conversation context:\n${recentContext}` : "",
-    `User prompt for this image:\n${cleanedPrompt}`,
+    `User prompt:\n${primaryPrompt}`,
   ].filter(Boolean).join("\n\n");
 }
 
@@ -534,17 +914,20 @@ async function getTextReplyWithMemory({ message, userId, conversationId, systemP
   const memoryKey = buildConversationKey({ userId, conversationId });
   const providedHistory = compactHistory(history, MAX_HISTORY_MESSAGES);
   const baseHistory = providedHistory.length ? providedHistory : getStoredHistory(memoryKey);
-  const searchQuery = buildSearchQuerySimple(cleanedMessage);
-  const needsWeb = shouldUseWebSimple(cleanedMessage);
-  console.log(`[WEB] simple detection requested=${needsWeb} query="${searchQuery}"`);
+  const searchPlan = buildSearchPlan(cleanedMessage);
+  const needsWeb = searchPlan.needsWeb;
+  console.log(`[WEB] requested=${needsWeb} query="${searchPlan.query}" topic=${searchPlan.topic} time=${searchPlan.timeRange || "none"}`);
 
-  const webSearch = needsWeb ? await searchWeb(searchQuery) : {
+  const webSearch = needsWeb ? await searchWeb(searchPlan) : {
     used: false,
-    query: searchQuery,
+    query: searchPlan.query,
     results: [],
     answer: "",
     contextText: "",
     error: "",
+    topic: searchPlan.topic,
+    timeRange: searchPlan.timeRange,
+    rawResultsCount: 0,
   };
 
   const finalMessages = [
@@ -553,7 +936,7 @@ async function getTextReplyWithMemory({ message, userId, conversationId, systemP
       content: [
         buildSystemPrompt(systemPrompt),
         webSearch.used
-          ? "When WEB DATA is provided, use it carefully and prefer those sources over guesses."
+          ? "When WEB DATA is provided, synthesize the answer from the ranked WEB SOURCES. Prefer official, primary, recent, and higher-relevance sources. Treat the Tavily draft answer as a lead, not proof. If the sources do not support a claim, say so instead of guessing. If sources conflict, mention the uncertainty."
           : "",
       ].filter(Boolean).join("\n\n"),
     },
@@ -582,11 +965,15 @@ async function getTextReplyWithMemory({ message, userId, conversationId, systemP
       web_requested: needsWeb,
       web_used: Boolean(webSearch.used),
       web_query: webSearch.query,
+      web_topic: webSearch.topic,
+      web_time_range: webSearch.timeRange || undefined,
       web_results_count: webSearch.results.length,
+      web_raw_results_count: webSearch.rawResultsCount || undefined,
       web_error: webSearch.error || undefined,
-      sources: webSearch.results.slice(0, 3).map((result) => ({
+      sources: webSearch.results.slice(0, 4).map((result) => ({
         title: result.title,
         url: result.url,
+        domain: result.domain,
       })),
       vision_used: false,
       conversation_id: conversationId || "default",
@@ -695,7 +1082,7 @@ app.post(
       }
 
       if (imageFile && isImageMimeType(imageFile.mimetype)) {
-        const imagePrompt = message || "What is in this image?";
+        const imagePrompt = message;
         const imageFileName = sanitizeFileName(imageFile.originalname || "upload-image");
         console.log(`[UPLOAD] image ${imageFileName} type=${imageFile.mimetype} bytes=${imageFile.size} prompt=${Boolean(message)}`);
         try {
@@ -711,7 +1098,7 @@ app.post(
 
           const assistantHistory = [
             ...history.slice(-MAX_HISTORY_MESSAGES),
-            { role: "user", content: imagePrompt },
+            { role: "user", content: imagePrompt || "[image uploaded as reference; no text prompt provided]" },
             { role: "assistant", content: reply },
           ];
           saveStoredHistory(buildConversationKey({ userId, conversationId }), assistantHistory);
@@ -729,7 +1116,7 @@ app.post(
             meta: {
               tier_used: modelLabel,
               vision_used: true,
-              prompt_used: imagePrompt,
+              prompt_used: imagePrompt || null,
               file_name: imageFileName,
               conversation_id: conversationId,
             },
@@ -737,7 +1124,8 @@ app.post(
         } catch (visionError) {
           console.log(`[ERROR] [UPLOAD] vision failed: ${visionError.message}`);
           const fallbackPrompt = message
-            || `The uploaded file "${imageFileName}" could not be analyzed by PMCAI. Respond helpfully without claiming to see the image.`;
+            ? `The uploaded reference image "${imageFileName}" could not be processed. Answer the user's prompt as best you can without claiming to see the image.\n\nUser prompt:\n${message}`
+            : `The uploaded reference image "${imageFileName}" could not be processed. Ask the user to enter a text prompt or retry the upload. Do not describe or caption the image.`;
           const fallback = await getTextReplyWithMemory({
             message: fallbackPrompt,
             userId,
@@ -761,7 +1149,7 @@ app.post(
               ...fallback.meta,
               vision_used: false,
               vision_fallback: true,
-              prompt_used: fallbackPrompt,
+              prompt_used: message || null,
               file_name: imageFileName,
             },
           });
